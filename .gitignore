@@ -15,3 +15,5 @@ dist/
 *.egg-info/
 .idea/
 .vscode/
+outputs/
+* .ipynb 

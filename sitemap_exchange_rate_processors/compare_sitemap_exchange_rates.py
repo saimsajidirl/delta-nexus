@@ -14,7 +14,7 @@ from selectolax.parser import HTMLParser
 
 # --- CONSTANTS ---
 DEFAULT_USER_AGENT: str = "DeltaNexus/1.0 (Unified Engine)"
-DEFAULT_CURRENCY_URL: str = "https://www.floatrates.com/daily.html"
+DEFAULT_CURRENCY_URL: str = "https://www.floatrates.com/"
 DEFAULT_BASE_CURRENCY: str = "USD"
 CURRENCY_FETCH_INTERVAL: float = 30.0
 
