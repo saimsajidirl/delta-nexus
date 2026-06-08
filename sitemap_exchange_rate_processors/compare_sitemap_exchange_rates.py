@@ -23,6 +23,9 @@ CURRENCY_FETCH_INTERVAL: float = 30.0
 class ProductPriceRecord(BaseModel):
     """Schema for scraped product data."""
     product_id: str = Field(..., min_length=1)
+    product_name: str | None = None
+    product_url: str | None = None
+    source_url: str | None = None
     price: float = Field(..., gt=0)
     currency: str = Field(default="USD")
     timestamp: datetime
@@ -80,7 +83,7 @@ class AsyncPriceScraper:
 
                 for event, elem in context:
                     # 1. Parse the element
-                    record = self._parse_element(elem)
+                    record = self._parse_element(elem, source_url)
                     
                     # 2. Critical: Yield control back to the event loop 
                     # This prevents the scraper from "starving" the currency fetcher
@@ -98,9 +101,11 @@ class AsyncPriceScraper:
                 logger.error(f"[PRICE_SCRAPER] Fatal error: {e}")
                 raise
 
-    def _parse_element(self, elem: etree._Element) -> ProductPriceRecord | None:
+    def _parse_element(self, elem: etree._Element, source_url: str | None = None) -> ProductPriceRecord | None:
         try:
             p_id = elem.findtext("id") or elem.findtext("sku")
+            p_name = elem.findtext("title") or elem.findtext("name")
+            p_url = elem.findtext("link") or elem.findtext("url") or elem.findtext("loc")
             raw_price = elem.findtext("price")
             raw_ts = elem.findtext("timestamp") or elem.findtext("updated_at")
 
@@ -109,6 +114,9 @@ class AsyncPriceScraper:
 
             return ProductPriceRecord(
                 product_id=str(p_id),
+                product_name=p_name,
+                product_url=p_url,
+                source_url=source_url,
                 price=float(raw_price),
                 currency=elem.findtext("currency") or "USD",
                 timestamp=datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
@@ -245,7 +253,11 @@ async def run_delta_nexus_engine(
     price_rows = [record.model_dump(mode="json") for record in price_records or []]
     rate_rows = [record.model_dump(mode="json") for record in rate_records or []]
 
-    _write_csv(output_dir / "scraped_product_prices.csv", price_rows, ["product_id", "price", "currency", "timestamp"])
+    _write_csv(
+        output_dir / "scraped_product_prices.csv",
+        price_rows,
+        ["product_id", "product_name", "product_url", "source_url", "price", "currency", "timestamp"],
+    )
     _write_csv(output_dir / "processed_currency_rates.csv", rate_rows, ["base_currency", "target_currency", "rate", "timestamp"])
     logger.info(f"Wrote CSV outputs to {output_dir.resolve()}")
 

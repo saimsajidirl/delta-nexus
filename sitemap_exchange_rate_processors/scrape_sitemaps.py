@@ -45,6 +45,9 @@ class ProductPriceRecord(BaseModel):
     Validates that prices are positive and IDs are non-empty.
     """
     product_id: str = Field(..., min_length=1)
+    product_name: str | None = None
+    product_url: str | None = None
+    source_url: str | None = None
     price: float = Field(..., gt=0)
     currency: str = Field(default="USD")
     timestamp: datetime
@@ -87,7 +90,7 @@ def _stream_xml_elements(source: Union[str, Path]) -> Iterator[etree._Element]:
         logger.error(f"Failed to access source {source}: {e}")
         raise ScraperIOError(f"IO failure during streaming: {e}")
 
-def _parse_element_to_record(element: etree._Element) -> ProductPriceRecord | None:
+def _parse_element_to_record(element: etree._Element, source_path: Union[str, Path] | None = None) -> ProductPriceRecord | None:
     """
     Maps XML sub-elements to the ProductPriceRecord dataclass.
     
@@ -113,6 +116,8 @@ def _parse_element_to_record(element: etree._Element) -> ProductPriceRecord | No
             return None
 
         p_id = first_text("id", "sku", "item_id", "product_id")
+        p_name = first_text("title", "name", "product_name")
+        p_url = first_text("link", "url", "loc", "product_url")
         raw_price = first_text("price", "g:price")
         raw_ts = first_text("timestamp", "updated_at", "last_updated", "pubDate")
         currency = first_text("currency") or "USD"
@@ -128,6 +133,9 @@ def _parse_element_to_record(element: etree._Element) -> ProductPriceRecord | No
 
         return ProductPriceRecord(
             product_id=str(p_id),
+            product_name=p_name,
+            product_url=p_url,
+            source_url=str(source_path) if source_path else None,
             price=float(price_value),
             currency=currency,
             timestamp=datetime.fromisoformat(raw_ts.replace("Z", "+00:00")) if raw_ts else datetime.utcnow()
@@ -157,7 +165,7 @@ def run_price_scraper(source_path: Union[str, Path]) -> Iterator[ProductPriceRec
 
     for element in _stream_xml_elements(source_path):
         count += 1
-        record = _parse_element_to_record(element)
+        record = _parse_element_to_record(element, source_path)
         
         if record:
             success_count += 1
