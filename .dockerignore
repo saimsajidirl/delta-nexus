@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+.git/
+.idea/
+.vscode/
+Delta_Nexus_Testing.ipynb
+Docs/

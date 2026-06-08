@@ -1,0 +1,7 @@
+httpx
+loguru
+pydantic
+selectolax
+lxml
+jupyter
+ipykernel
