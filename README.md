@@ -1,6 +1,7 @@
 # Delta Nexus
+Delta Nexus is an asynchronous Python data-ingestion pipeline that scrapes product XML feeds and live currency exchange rates through a unified workflow. It validates, processes, logs, and exports structured records to CSV while using Kafka as a Message Broker.
 
-Delta Nexus is a Python scraping pipeline for two public data sources:
+Its a Python scraping pipeline for two public data sources:
 
 1. product or sitemap XML feeds
 2. live currency exchange rate pages
