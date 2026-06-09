@@ -5,3 +5,5 @@ selectolax
 lxml
 jupyter
 ipykernel
+aiokafka
+kafka-python

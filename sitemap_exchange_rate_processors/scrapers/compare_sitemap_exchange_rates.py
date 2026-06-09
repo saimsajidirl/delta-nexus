@@ -9,8 +9,14 @@ from typing import AsyncIterator, Union
 import httpx
 from lxml import etree
 from loguru import logger
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import ValidationError
 from selectolax.parser import HTMLParser
+
+from ..broker import (
+    MessageBrokerClient,
+    ProductPriceRecord,
+    CurrencyRateRecord,
+)
 
 # --- CONSTANTS ---
 DEFAULT_USER_AGENT: str = "DeltaNexus/1.0 (Unified Engine)"
@@ -18,38 +24,16 @@ DEFAULT_CURRENCY_URL: str = "https://www.floatrates.com/"
 DEFAULT_BASE_CURRENCY: str = "USD"
 CURRENCY_FETCH_INTERVAL: float = 30.0
 
-# --- DATA MODELS ---
 
-class ProductPriceRecord(BaseModel):
-    """Schema for scraped product data."""
-    product_id: str = Field(..., min_length=1)
-    product_name: str | None = None
-    product_url: str | None = None
-    source_url: str | None = None
-    price: float = Field(..., gt=0)
-    currency: str = Field(default="USD")
-    timestamp: datetime
-
-class CurrencyRateRecord(BaseModel):
-    """Schema for scraped exchange rates."""
-    base_currency: str
-    target_currency: str
-    rate: float
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-# --- BROKER INTERFACE (Pre-Task 2) ---
-
-class MessageBrokerClient:
+class StubMessageBrokerClient(MessageBrokerClient):
     """
-    Acts as the gateway to Task 2. 
-    Currently logs hand-offs; will be replaced by Kafka/RabbitMQ producer.
+    Stub broker that logs records without sending them anywhere.
+    Useful for testing and learning.
     """
     async def send_price_data(self, record: ProductPriceRecord) -> None:
-        # In Task 2, this becomes: await self.producer.send("prices", record.json())
         logger.debug(f"[BROKER] Handoff Price: {record.product_id} @ {record.price} {record.currency}")
 
     async def send_currency_data(self, record: CurrencyRateRecord) -> None:
-        # In Task 2, this becomes: await self.producer.send("rates", record.json())
         logger.debug(f"[BROKER] Handoff Rate: {record.base_currency}/{record.target_currency} = {record.rate}")
 
 # --- COLLECTOR 1: THE PRICE SCRAPER (ASYNC) ---
@@ -233,33 +217,52 @@ async def run_delta_nexus_engine(
     price_url: str,
     currency_url: str = DEFAULT_CURRENCY_URL,
     output_dir: str | Path = ".",
+    use_kafka: bool = False,
+    kafka_servers: str = "localhost:9092",
 ):
     """
-    The Unified Program Block. 
+    The Unified Program Block.
     Runs both collectors simultaneously without blocking.
+
+    Args:
+        price_url: XML feed/sitemap URL
+        currency_url: Currency page URL (defaults to FloatRates)
+        output_dir: Where to write CSV files
+        use_kafka: If True, send records to Kafka instead of stub broker
+        kafka_servers: Kafka bootstrap servers (e.g., "localhost:9092,localhost:9093")
     """
     logger.info("--- INITIALIZING DELTA NEXUS ENGINE ---")
-    
-    broker = MessageBrokerClient()
+
+    if use_kafka:
+        from ..broker import KafkaMessageBrokerClient
+        broker = KafkaMessageBrokerClient(bootstrap_servers=kafka_servers)
+        await broker.connect()
+    else:
+        broker = StubMessageBrokerClient()
+
     price_scraper = AsyncPriceScraper()
     currency_fetcher = AsyncCurrencyFetcher(target_url=currency_url)
 
-    price_records, rate_records = await asyncio.gather(
-        run_price_task(price_scraper, price_url, broker),
-        run_currency_task(currency_fetcher, DEFAULT_BASE_CURRENCY, CURRENCY_FETCH_INTERVAL, broker),
-    )
+    try:
+        price_records, rate_records = await asyncio.gather(
+            run_price_task(price_scraper, price_url, broker),
+            run_currency_task(currency_fetcher, DEFAULT_BASE_CURRENCY, CURRENCY_FETCH_INTERVAL, broker),
+        )
 
-    output_dir = Path(output_dir)
-    price_rows = [record.model_dump(mode="json") for record in price_records or []]
-    rate_rows = [record.model_dump(mode="json") for record in rate_records or []]
+        output_dir = Path(output_dir)
+        price_rows = [record.model_dump(mode="json") for record in price_records or []]
+        rate_rows = [record.model_dump(mode="json") for record in rate_records or []]
 
-    _write_csv(
-        output_dir / "scraped_product_prices.csv",
-        price_rows,
-        ["product_id", "product_name", "product_url", "source_url", "price", "currency", "timestamp"],
-    )
-    _write_csv(output_dir / "processed_currency_rates.csv", rate_rows, ["base_currency", "target_currency", "rate", "timestamp"])
-    logger.info(f"Wrote CSV outputs to {output_dir.resolve()}")
+        _write_csv(
+            output_dir / "scraped_product_prices.csv",
+            price_rows,
+            ["product_id", "product_name", "product_url", "source_url", "price", "currency", "timestamp"],
+        )
+        _write_csv(output_dir / "processed_currency_rates.csv", rate_rows, ["base_currency", "target_currency", "rate", "timestamp"])
+        logger.info(f"Wrote CSV outputs to {output_dir.resolve()}")
+    finally:
+        if use_kafka:
+            await broker.disconnect()
 
 
 if __name__ == "__main__":
