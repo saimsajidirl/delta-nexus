@@ -1,5 +1,3 @@
-"""Product feed scraping for Delta Nexus."""
-
 import argparse
 import asyncio
 from datetime import datetime, timezone
