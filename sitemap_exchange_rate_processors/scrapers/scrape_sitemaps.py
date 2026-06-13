@@ -1,182 +1,170 @@
-import argparse
-import os
-from io import BytesIO
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Iterator, Union
-from lxml import etree
-from pydantic import BaseModel, Field, ValidationError
-from loguru import logger
+"""Product feed scraping for Delta Nexus."""
 
-DEFAULT_USER_AGENT: str = "DeltaNexus/1.0 (Price Scraper Engine)"
-DEFAULT_TIMEOUT: int = 30
-NS_MAP: dict[str, str] = {} 
+import argparse
+import asyncio
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from typing import AsyncIterator, Iterator
+
+import httpx
+from loguru import logger
+from lxml import etree
+from pydantic import ValidationError
+
+from ..broker import ProductPriceRecord
+
+
+DEFAULT_USER_AGENT = "DeltaNexus/1.0 (Price Scraper)"
+PRODUCT_TAGS = {"item", "product", "url"}
+
+
+class ScraperError(Exception):
+    """Base exception for product scraper failures."""
+
+
+class ScraperIOError(ScraperError):
+    """Raised when a product feed cannot be read."""
+
+
+class ScraperParsingError(ScraperError):
+    """Raised when a product feed contains malformed XML."""
 
 
 def _local_name(tag: object) -> str:
-    """Return the XML local name without namespace noise."""
+    """Return an XML tag name without its namespace."""
     text = str(tag)
     if "}" in text:
         return text.rsplit("}", 1)[1]
     return text.split(":", 1)[-1]
 
-class ScraperError(Exception):
-    """Base exception for all scraper-related errors."""
-    pass
 
-class ScraperIOError(ScraperError):
-    """Raised when file access or network retrieval fails."""
-    pass
+def _first_text(element: etree._Element, *names: str) -> str | None:
+    wanted = set(names)
+    for child in element.iterchildren():
+        if _local_name(child.tag) in wanted and child.text:
+            return child.text.strip()
+    return None
 
-class ScraperParsingError(ScraperError):
-    """Raised when the XML structure is malformed or unreadable."""
-    pass
 
-class DataValidationError(ScraperError):
-    """Raised when extracted data does not meet the required schema."""
-    pass
-
-class ProductPriceRecord(BaseModel):
-    """
-    Strict schema for a single scraped product record.
-    Validates that prices are positive and IDs are non-empty.
-    """
-    product_id: str = Field(..., min_length=1)
-    product_name: str | None = None
-    product_url: str | None = None
-    source_url: str | None = None
-    price: float = Field(..., gt=0)
-    currency: str = Field(default="USD")
-    timestamp: datetime
-
-def _stream_xml_elements(source: Union[str, Path]) -> Iterator[etree._Element]:
-    """
-    An event-driven generator that streams XML elements one by one.
-    
-    Uses lxml.etree.iterparse to ensure that we do not load the entire 
-    XML tree into memory, satisfying the low-memory requirement.
-    
-    """
+def parse_product_element(
+    element: etree._Element,
+    source_url: str | None = None,
+) -> ProductPriceRecord | None:
+    """Convert one XML product element into the shared product schema."""
     try:
-        context = etree.iterparse(str(source), events=("end",), recover=False)
-        
-        for event, elem in context:
-            if _local_name(elem.tag) in ("item", "product", "url"):
-                yield elem
+        product_id = _first_text(element, "id", "sku", "item_id", "product_id")
+        product_name = _first_text(element, "title", "name", "product_name")
+        product_url = _first_text(element, "link", "url", "loc", "product_url")
+        raw_price = _first_text(element, "price")
+        raw_timestamp = _first_text(
+            element,
+            "timestamp",
+            "updated_at",
+            "last_updated",
+            "pubDate",
+        )
+        currency = _first_text(element, "currency") or "USD"
 
-                elem.clear()
-                while elem.getprevious() is not None:
-                    del elem.getparent()[0]
-                    
-    except etree.XMLSyntaxError as e:
-        logger.error(f"Malformed XML detected in {source}: {e}")
-        raise ScraperParsingError(f"Failed to parse XML: {e}")
-    except (IOError, OSError) as e:
-        logger.error(f"Failed to access source {source}: {e}")
-        raise ScraperIOError(f"IO failure during streaming: {e}")
-
-def _parse_element_to_record(element: etree._Element, source_path: Union[str, Path] | None = None) -> ProductPriceRecord | None:
-    """
-    Maps XML sub-elements to the ProductPriceRecord dataclass.
-    
-    This function handles the logic of finding specific tags (id, price, etc.)
-    within the current XML node.
-
-    """
-    try:
-        def first_text(*names: str) -> str | None:
-            for child in element.iterchildren():
-                if _local_name(child.tag) in names and child.text:
-                    return child.text.strip()
-            for name in names:
-                value = element.findtext(name)
-                if value:
-                    return value.strip()
+        if not product_id or not raw_price:
             return None
 
-        p_id = first_text("id", "sku", "item_id", "product_id")
-        p_name = first_text("title", "name", "product_name")
-        p_url = first_text("link", "url", "loc", "product_url")
-        raw_price = first_text("price", "g:price")
-        raw_ts = first_text("timestamp", "updated_at", "last_updated", "pubDate")
-        currency = first_text("currency") or "USD"
-
-        if not all([p_id, raw_price]):
-            logger.debug(f"Skipping element: Missing required fields (ID: {p_id}, Price: {raw_price})")
-            return None
-
-        price_parts = str(raw_price).split()
-        price_value = price_parts[0]
+        price_parts = raw_price.split()
         if len(price_parts) > 1 and currency == "USD":
             currency = price_parts[-1]
 
-        return ProductPriceRecord(
-            product_id=str(p_id),
-            product_name=p_name,
-            product_url=p_url,
-            source_url=str(source_path) if source_path else None,
-            price=float(price_value),
-            currency=currency,
-            timestamp=datetime.fromisoformat(raw_ts.replace("Z", "+00:00")) if raw_ts else datetime.utcnow()
+        timestamp = (
+            datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            if raw_timestamp
+            else datetime.now(timezone.utc)
         )
-
-    except (ValueError, TypeError, ValidationError) as e:
-        logger.warning(f"Data validation failed for element {element.tag}: {e}")
+        return ProductPriceRecord(
+            product_id=product_id,
+            product_name=product_name,
+            product_url=product_url,
+            source_url=source_url,
+            price=float(price_parts[0]),
+            currency=currency,
+            timestamp=timestamp,
+        )
+    except (TypeError, ValueError, ValidationError) as exc:
+        logger.warning(f"Skipping invalid product element '{element.tag}': {exc}")
         return None
 
-def run_sitemaps_scraper(source_path: Union[str, Path]) -> Iterator[ProductPriceRecord]:
-    """
-    The primary domain entry-point for the Price Scraper.
-    
-    Orchestrates the streaming of the XML file and the conversion of 
-    raw elements into validated ProductPriceRecord objects.
 
-    """
-    logger.info(f"Starting Price Scraper on source: {source_path}")
-    
-    count = 0
-    success_count = 0
+def _iter_product_elements(source: str | Path) -> Iterator[etree._Element]:
+    try:
+        context = etree.iterparse(str(source), events=("end",), recover=False)
+        for _, element in context:
+            if _local_name(element.tag) not in PRODUCT_TAGS:
+                continue
+            yield element
+            element.clear()
+            while element.getprevious() is not None:
+                del element.getparent()[0]
+    except etree.XMLSyntaxError as exc:
+        raise ScraperParsingError(f"Failed to parse XML: {exc}") from exc
+    except (OSError, IOError) as exc:
+        raise ScraperIOError(f"Failed to read product feed: {exc}") from exc
 
-    for element in _stream_xml_elements(source_path):
-        count += 1
-        record = _parse_element_to_record(element, source_path)
-        
+
+class AsyncPriceScraper:
+    """Fetch and incrementally parse XML product feeds."""
+
+    def __init__(self, user_agent: str = DEFAULT_USER_AGENT):
+        self.headers = {"User-Agent": user_agent}
+
+    async def stream_prices(
+        self,
+        source_url: str,
+    ) -> AsyncIterator[ProductPriceRecord]:
+        logger.info(f"[PRICE_SCRAPER] Starting stream from {source_url}")
+
+        async with httpx.AsyncClient(headers=self.headers, timeout=60.0) as client:
+            response = await client.get(source_url)
+            response.raise_for_status()
+
+        try:
+            context = etree.iterparse(
+                BytesIO(response.content),
+                events=("end",),
+                recover=False,
+            )
+            for _, element in context:
+                if _local_name(element.tag) not in PRODUCT_TAGS:
+                    continue
+
+                record = parse_product_element(element, source_url)
+                await asyncio.sleep(0)
+                if record:
+                    yield record
+
+                element.clear()
+                while element.getprevious() is not None:
+                    del element.getparent()[0]
+        except etree.XMLSyntaxError as exc:
+            raise ScraperParsingError(f"Failed to parse XML: {exc}") from exc
+
+
+def run_sitemaps_scraper(
+    source_path: str | Path,
+) -> Iterator[ProductPriceRecord]:
+    """Backward-compatible synchronous entry point for local XML files."""
+    logger.info(f"Starting product scraper on source: {source_path}")
+    for element in _iter_product_elements(source_path):
+        record = parse_product_element(element, str(source_path))
         if record:
-            success_count += 1
             yield record
 
-    logger.info(f"Scrape completed. Processed: {count} | Valid Records: {success_count}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Delta Nexus - High-Efficiency Price Scraper")
-    parser.add_argument(
-        "--source", 
-        type=str, 
-        required=True, 
-        help="Path to the XML sitemap or product feed"
-    )
-    parser.add_argument(
-        "--output-log", 
-        type=str, 
-        default="scraper.log", 
-        help="File to save logs to"
-    )
-
+    parser = argparse.ArgumentParser(description="Delta Nexus product feed scraper")
+    parser.add_argument("--source", required=True, help="Path to an XML product feed")
     args = parser.parse_args()
 
-    logger.add(args.output_log, rotation="500 MB", retention="10 days")
-
     try:
-        for product_record in run_sitemaps_scraper(Path(args.source)):
-            logger.debug(f"Extracted: {product_record.json()}")
-            
-    except ScraperError as e:
-        logger.critical(f"Scraper halted due to a critical error: {e}")
-        exit(1)
-    except KeyboardInterrupt:
-        logger.info("Scraper interrupted by user.")
-        exit(0)
-    except Exception as e:
-        logger.exception(f"An unexpected system error occurred: {e}")
-        exit(1)
+        for product_record in run_sitemaps_scraper(args.source):
+            logger.info(product_record.model_dump_json())
+    except ScraperError as exc:
+        logger.critical(f"Scraper failed: {exc}")
+        raise SystemExit(1) from exc

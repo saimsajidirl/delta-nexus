@@ -4,7 +4,13 @@ import json
 from pathlib import Path
 from aiokafka import AIOKafkaConsumer
 from loguru import logger
-from .broker import ProductPriceRecord, CurrencyRateRecord
+from .broker import (
+    FX_TOPIC,
+    SCHEMA_VERSION,
+    PRICE_TOPIC,
+    CurrencyRateEvent,
+    ProductPriceEvent,
+)
 
 
 class KafkaConsumerWriter:
@@ -16,8 +22,8 @@ class KafkaConsumerWriter:
     def __init__(
         self,
         bootstrap_servers: str = "localhost:9092",
-        price_topic: str = "product-prices",
-        rate_topic: str = "currency-rates",
+        price_topic: str = PRICE_TOPIC,
+        rate_topic: str = FX_TOPIC,
         output_dir: str | Path = ".",
         group_id: str = "delta-nexus-consumer",
     ):
@@ -57,21 +63,29 @@ class KafkaConsumerWriter:
                 async for message in consumer:
                     if message.topic == self.price_topic:
                         try:
-                            record = ProductPriceRecord(**message.value)
-                            self.price_records.append(record.model_dump(mode="json"))
+                            event = ProductPriceEvent(**message.value)
+                            if event.schema_version != SCHEMA_VERSION:
+                                raise ValueError(
+                                    f"Unsupported schema_version {event.schema_version}"
+                                )
+                            self.price_records.append(event.model_dump(mode="json"))
                             logger.debug(
-                                f"[KAFKA_CONSUMER] Received price: {record.product_id}"
+                                f"[KAFKA_CONSUMER] Received price: {event.product_id}"
                             )
                         except Exception as e:
                             logger.error(f"[KAFKA_CONSUMER] Invalid price record: {e}")
 
                     elif message.topic == self.rate_topic:
                         try:
-                            record = CurrencyRateRecord(**message.value)
-                            self.rate_records.append(record.model_dump(mode="json"))
+                            event = CurrencyRateEvent(**message.value)
+                            if event.schema_version != SCHEMA_VERSION:
+                                raise ValueError(
+                                    f"Unsupported schema_version {event.schema_version}"
+                                )
+                            self.rate_records.append(event.model_dump(mode="json"))
                             logger.debug(
                                 f"[KAFKA_CONSUMER] Received rate: "
-                                f"{record.base_currency}/{record.target_currency}"
+                                f"{event.base_currency}/{event.target_currency}"
                             )
                         except Exception as e:
                             logger.error(f"[KAFKA_CONSUMER] Invalid rate record: {e}")
@@ -90,6 +104,9 @@ class KafkaConsumerWriter:
                 writer = csv.DictWriter(
                     f,
                     fieldnames=[
+                        "schema_version",
+                        "event_type",
+                        "emitted_at",
                         "product_id",
                         "product_name",
                         "product_url",
@@ -108,7 +125,15 @@ class KafkaConsumerWriter:
             with rate_path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=["base_currency", "target_currency", "rate", "timestamp"],
+                    fieldnames=[
+                        "schema_version",
+                        "event_type",
+                        "emitted_at",
+                        "base_currency",
+                        "target_currency",
+                        "rate",
+                        "timestamp",
+                    ],
                 )
                 writer.writeheader()
                 writer.writerows(self.rate_records)
@@ -117,8 +142,8 @@ class KafkaConsumerWriter:
 
 async def consume_from_kafka(
     bootstrap_servers: str = "localhost:9092",
-    price_topic: str = "product-prices",
-    rate_topic: str = "currency-rates",
+    price_topic: str = PRICE_TOPIC,
+    rate_topic: str = FX_TOPIC,
     output_dir: str | Path = ".",
     timeout_seconds: int = 60,
 ) -> None:

@@ -2,9 +2,12 @@ import json
 from aiokafka import AIOKafkaProducer
 from loguru import logger
 from .broker import (
+    FX_TOPIC,
+    PRICE_TOPIC,
     MessageBrokerClient,
     ProductPriceRecord,
     CurrencyRateRecord,
+    SCHEMA_VERSION,
 )
 
 
@@ -17,8 +20,8 @@ class KafkaMessageBrokerClient(MessageBrokerClient):
     def __init__(
         self,
         bootstrap_servers: str = "localhost:9092",
-        price_topic: str = "product-prices",
-        rate_topic: str = "currency-rates",
+        price_topic: str = PRICE_TOPIC,
+        rate_topic: str = FX_TOPIC,
     ):
         self.bootstrap_servers = bootstrap_servers
         self.price_topic = price_topic
@@ -29,7 +32,7 @@ class KafkaMessageBrokerClient(MessageBrokerClient):
         """Initialize the Kafka producer."""
         self.producer = AIOKafkaProducer(
             bootstrap_servers=self.bootstrap_servers,
-            value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
+            value_serializer=lambda v: json.dumps(v, default=str, separators=(",", ":")).encode("utf-8"),
         )
         await self.producer.start()
         logger.info(f"[KAFKA] Connected to {self.bootstrap_servers}")
@@ -46,9 +49,15 @@ class KafkaMessageBrokerClient(MessageBrokerClient):
             raise RuntimeError("Kafka producer not connected. Call connect() first.")
 
         try:
+            event = {
+                "schema_version": SCHEMA_VERSION,
+                "event_type": "product_price",
+                "emitted_at": record.timestamp,
+                **record.model_dump(mode="json"),
+            }
             await self.producer.send_and_wait(
                 self.price_topic,
-                value=record.model_dump(mode="json"),
+                value=event,
                 key=record.product_id.encode("utf-8"),
             )
             logger.debug(
@@ -66,9 +75,15 @@ class KafkaMessageBrokerClient(MessageBrokerClient):
 
         try:
             key = f"{record.base_currency}/{record.target_currency}".encode("utf-8")
+            event = {
+                "schema_version": SCHEMA_VERSION,
+                "event_type": "currency_rate",
+                "emitted_at": record.timestamp,
+                **record.model_dump(mode="json"),
+            }
             await self.producer.send_and_wait(
                 self.rate_topic,
-                value=record.model_dump(mode="json"),
+                value=event,
                 key=key,
             )
             logger.debug(

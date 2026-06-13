@@ -1,13 +1,14 @@
 # Delta Nexus
 
-Delta Nexus is a production-ready Python scraping pipeline that fetches and processes data from two public sources:
+Delta Nexus is a learning-focused Python data pipeline that fetches and processes data from two public sources:
 
 1. **Product data**: XML feeds or sitemap URLs
 2. **Currency rates**: Live exchange rate pages (FloatRates-style HTML)
 
-The pipeline decouples data collection from processing using an abstract message broker that supports two modes:
-- **Stub broker** (default): Direct CSV output with zero external dependencies
-- **Kafka broker**: Scalable, real-time processing with support for multiple consumers
+The pipeline decouples data collection from processing using Kafka as the default message path.
+For local experiments, a stub broker is also available without external infrastructure.
+
+> **Project status:** Delta Nexus is an evolving portfolio and learning project. It demonstrates async collection, validated event contracts, Kafka integration, and CSV persistence, but it is not yet production-ready. Production use still requires durable storage, retries and dead-letter handling, observability, security, deployment automation, and broader integration/load testing.
 
 ## Quick Start
 
@@ -27,7 +28,7 @@ asyncio.run(
 
 Records are logged and written to CSV files in the specified output directory.
 
-### Kafka Mode (Scalable Real-Time)
+### Kafka Mode (Decoupled Message Path)
 
 ```python
 import asyncio
@@ -42,7 +43,7 @@ asyncio.run(
 )
 ```
 
-Kafka enables decoupled, real-time processing with support for multiple consumers processing the same data independently.
+Kafka decouples collection from downstream processing and allows independent consumer groups. The current project is a single-node development setup, not a benchmarked real-time deployment.
 
 ## Architecture
 
@@ -98,12 +99,12 @@ sitemap_exchange_rate_processors/
 
 #### `scrape_sitemaps.py` — AsyncPriceScraper
 
-Streams XML records incrementally using `lxml.etree.iterparse()` to handle large feeds without loading everything into memory.
+Downloads an XML feed and parses its product elements incrementally using `lxml.etree.iterparse()`. The parser clears processed nodes, although the HTTP response is currently buffered before parsing.
 
 **Features:**
 - Extracts `product_id`, `product_name`, `product_url`, `price`, `currency`, `timestamp`
 - Flexible field mapping: recognizes `id`, `sku`, `item_id`, `product_id`
-- Memory-efficient: clears parsed nodes as it streams
+- Clears parsed XML nodes to limit parser memory growth
 - Validates data into `ProductPriceRecord` schema (Pydantic)
 
 #### `scrape_exchange_rates.py` — AsyncCurrencyFetcher
@@ -119,14 +120,14 @@ Fetches and parses HTML exchange rate tables.
 
 #### `compare_sitemap_exchange_rates.py` — run_delta_nexus_engine
 
-Orchestrates both scrapers asynchronously and routes records through the message broker.
+Imports the canonical scraper classes, orchestrates them asynchronously, and routes records through the message broker. Scraping and parsing logic remains in the source-specific modules.
 
 **Pipeline:**
 1. Start XML scraper task
-2. Start currency fetcher task
+2. Fetch one currency-rate snapshot
 3. Validate records as they arrive
 4. Send to broker (stub or Kafka)
-5. Return completion stats
+5. Write CSV output and finish the run
 
 ### Broker (`broker/`)
 
@@ -141,13 +142,13 @@ Defines:
 
 #### `kafka_broker.py` — KafkaMessageBrokerClient
 
-Sends records to Kafka topics (default topics: `product-prices`, `currency-rates`).
+Sends records to Kafka topics (default topics: `raw-prices`, `fx-rates`).
 
 **Methods:**
 - `connect()` — Initialize producer
 - `disconnect()` — Close producer
-- `send_price_data(record)` — Send to `product-prices` topic
-- `send_currency_data(record)` — Send to `currency-rates` topic
+- `send_price_data(record)` — Send to `raw-prices` topic
+- `send_currency_data(record)` — Send to `fx-rates` topic
 
 #### `kafka_consumer.py` — KafkaConsumerWriter
 
@@ -222,7 +223,7 @@ asyncio.run(
 | `price_url` | str | required | XML feed or sitemap URL |
 | `currency_url` | str | `https://www.floatrates.com/daily.html` | Exchange rate page URL |
 | `output_dir` | str | `.` (current dir) | Where to write CSV files |
-| `use_kafka` | bool | `False` | Enable Kafka mode |
+| `use_kafka` | bool | `True` | Enable Kafka mode |
 | `kafka_servers` | str | `localhost:9092` | Kafka bootstrap servers |
 
 **Returns:** `dict` with keys `prices_count`, `rates_count`, `processing_time_seconds`
@@ -243,8 +244,8 @@ print(f"Processed {result['prices_count']} products")
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `bootstrap_servers` | str | `localhost:9092` | Kafka broker address |
-| `price_topic` | str | `product-prices` | Topic for product data |
-| `rate_topic` | str | `currency-rates` | Topic for rates |
+| `price_topic` | str | `raw-prices` | Topic for product data |
+| `rate_topic` | str | `fx-rates` | Topic for rates |
 | `output_dir` | str | `.` | Where to write CSVs |
 | `timeout_seconds` | int | `60` | Max wait for messages |
 
@@ -307,8 +308,43 @@ pip install aiokafka
 Delta Nexus expects Kafka to be running and accessible at the specified `bootstrap_servers` URL.
 
 **Topics:**
-- `product-prices` — Product price records (JSON)
-- `currency-rates` — Exchange rate records (JSON)
+- `raw-prices` — Product price records (JSON)
+- `fx-rates` — Exchange rate records (JSON)
+
+### Event Contract
+
+Kafka messages use a versioned JSON envelope with these shared fields:
+
+- `schema_version` - currently `1.0`
+- `event_type` - `product_price` or `currency_rate`
+- `emitted_at` - UTC timestamp when the event was published
+
+Required fields for product price events:
+
+- `product_id`
+- `price`
+- `timestamp`
+
+Optional fields for product price events:
+
+- `product_name`
+- `product_url`
+- `source_url`
+- `currency`
+
+Required fields for FX rate events:
+
+- `base_currency`
+- `target_currency`
+- `rate`
+- `timestamp`
+
+Compatibility rules:
+
+- Consumers must accept messages with the current `schema_version` only.
+- New optional fields may be added without breaking existing consumers.
+- Required fields should not be removed or renamed without bumping `schema_version`.
+- Topic names are stable contract names and should be updated in producer and consumer together.
 
 **Deployment options:**
 - **Self-managed**: Kafka cluster on-premises or cloud VMs
@@ -338,12 +374,12 @@ from sitemap_exchange_rate_processors.scrapers import AsyncPriceScraper, AsyncCu
 
 # Test price scraper
 scraper = AsyncPriceScraper()
-async for record in scraper.scrape("https://example.com/products.xml"):
+async for record in scraper.stream_prices("https://example.com/products.xml"):
     print(record)
 
 # Test currency fetcher
-fetcher = AsyncCurrencyFetcher()
-rates = await fetcher.fetch_rates()
+fetcher = AsyncCurrencyFetcher("https://www.floatrates.com/")
+rates = await fetcher.fetch_rates("USD")
 ```
 
 ## Choosing Stub vs Kafka
@@ -352,9 +388,9 @@ rates = await fetcher.fetch_rates()
 |----------|------|-----|
 | Local development | Stub | Zero dependencies, instant CSV |
 | One-time data export | Stub | Simple, no infrastructure |
-| Production pipeline | Kafka | Scalable, decoupled, real-time |
+| Production-oriented prototype | Kafka | Decouples producers and consumers |
 | Multiple consumers | Kafka | Each runs independently |
-| High-volume data | Kafka | Async, fault-tolerant |
+| Higher-volume experiments | Kafka | Supports partitioned message processing; load testing is still required |
 
 ## Output Formats
 
@@ -419,7 +455,7 @@ See LICENSE file for details.
 
 ## Notes
 
-- Delta Nexus is a prototype but production-ready for single-threaded scraping
+- Delta Nexus is a learning prototype and should not yet be treated as production-ready
 - Live URLs are required; feeds are not bundled
 - CSV files are overwritten each run (consider timestamping in production)
 - Kafka integration uses `aiokafka` for async support
