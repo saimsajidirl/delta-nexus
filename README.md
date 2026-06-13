@@ -1,115 +1,461 @@
 # Delta Nexus
 
-Delta Nexus is a Python scraping pipeline for two public data sources:
+Delta Nexus is a learning-focused Python data pipeline that fetches and processes data from two public sources:
 
-1. product or sitemap XML feeds
-2. live currency exchange rate pages
+1. **Product data**: XML feeds or sitemap URLs
+2. **Currency rates**: Live exchange rate pages (FloatRates-style HTML)
 
-The code is organized so the same data can be fetched, parsed, validated, logged, and exported to CSV from one unified runner.
+The pipeline decouples data collection from processing using Kafka as the default message path.
+For local experiments, a stub broker is also available without external infrastructure.
 
-## Project layout
+> **Project status:** Delta Nexus is an evolving portfolio and learning project. It demonstrates async collection, validated event contracts, Kafka integration, and CSV persistence, but it is not yet production-ready. Production use still requires durable storage, retries and dead-letter handling, observability, security, deployment automation, and broader integration/load testing.
 
-- `scrape_sitemaps.py`
-  - streams XML records one element at a time
-  - extracts product fields
-  - validates them into `ProductPriceRecord`
-- `scrape_exchange_rates.py`
-  - fetches a FloatRates-style HTML page
-  - parses the exchange-rate table
-  - yields `CurrencyRateRecord` objects in a polling loop
-- `compare_sitemap_exchange_rates.py`
-  - runs both collectors together
-  - sends each validated record through the broker stub
-  - writes the collected rows to CSV at the end of the run
+## Quick Start
 
-## Main flow
-
-If you run the unified entrypoint `run_delta_nexus_engine(...)`, Delta Nexus does the whole pipeline:
-
-1. start the XML scraper task
-2. start the currency fetcher task
-3. validate and collect records from both streams
-4. send each record through the broker stub
-5. write the final outputs to CSV files
-
-The current output files are:
-
-- `scraped_product_prices.csv`
-- `processed_currency_rates.csv`
-
-These files are written into the output directory you pass to the function. If you do not pass one, they are written in the current working directory.
-
-## Entry point
-
-The unified function is:
-
-```python
-await run_delta_nexus_engine(price_url, currency_url, output_dir)
-```
-
-Parameters:
-
-- `price_url`: a public XML feed or sitemap URL
-- `currency_url`: a FloatRates-style HTML page, defaulting to `https://www.floatrates.com/daily.html`
-- `output_dir`: folder where the CSV files will be saved
-
-Example:
+### Stub Mode (No External Dependencies)
 
 ```python
 import asyncio
-from compare_sitemap_exchange_rates import run_delta_nexus_engine
+from sitemap_exchange_rate_processors import run_delta_nexus_engine
 
 asyncio.run(
     run_delta_nexus_engine(
-        "https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
-        "https://www.floatrates.com/daily.html",
-        output_dir="outputs"
+        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
+        currency_url="https://www.floatrates.com/daily.html"
     )
 )
 ```
 
-## What each part does
+Records are logged and written to CSV files in the specified output directory.
 
-### XML scraper
+### Kafka Mode (Decoupled Message Path)
 
-The XML scraper uses `lxml.etree.iterparse()` so it can process records incrementally instead of loading the whole file into memory. For each matching XML element, it tries to read:
+```python
+import asyncio
+from sitemap_exchange_rate_processors import run_delta_nexus_engine
 
-- `id`, `sku`, `item_id`, or `product_id`
+asyncio.run(
+    run_delta_nexus_engine(
+        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
+        use_kafka=True,
+        kafka_servers="kafka-broker.example.com:9092"
+    )
+)
+```
+
+Kafka decouples collection from downstream processing and allows independent consumer groups. The current project is a single-node development setup, not a benchmarked real-time deployment.
+
+## Architecture
+
+### High-Level Flow
+
+```
+┌─────────────────────────────────────────┐
+│      Delta Nexus Scrapers               │
+│  - XML Product Scraper (sitemap)        │
+│  - Currency Rate Fetcher (HTML table)   │
+└──────────────┬──────────────────────────┘
+               │ (records)
+               ▼
+    ┌──────────────────────┐
+    │  Message Broker      │
+    │  (Abstract Interface)│
+    └──┬──────────────┬────┘
+       │              │
+   (Stub)        (Kafka)
+       │              │
+       ▼              ▼
+    CSV Files    Kafka Topics
+    (immediate)  (async)
+                    │
+                    ▼
+            ┌───────────────┐
+            │ Consumers     │
+            │ - CSV Writer  │
+            │ - Database    │
+            │ - Alerts      │
+            │ - Analytics   │
+            └───────────────┘
+```
+
+### Project Structure
+
+```
+sitemap_exchange_rate_processors/
+├── scrapers/
+│   ├── scrape_sitemaps.py           # XML parsing + validation
+│   ├── scrape_exchange_rates.py     # HTML table parsing
+│   └── compare_sitemap_exchange_rates.py  # Unified orchestrator
+├── broker/
+│   ├── broker.py                    # Abstract broker interface
+│   ├── kafka_broker.py              # Kafka producer implementation
+│   └── kafka_consumer.py            # Kafka consumer + CSV writer
+└── __init__.py                      # Package exports
+```
+
+## Components
+
+### Scrapers (`scrapers/`)
+
+#### `scrape_sitemaps.py` — AsyncPriceScraper
+
+Downloads an XML feed and parses its product elements incrementally using `lxml.etree.iterparse()`. The parser clears processed nodes, although the HTTP response is currently buffered before parsing.
+
+**Features:**
+- Extracts `product_id`, `product_name`, `product_url`, `price`, `currency`, `timestamp`
+- Flexible field mapping: recognizes `id`, `sku`, `item_id`, `product_id`
+- Clears parsed XML nodes to limit parser memory growth
+- Validates data into `ProductPriceRecord` schema (Pydantic)
+
+#### `scrape_exchange_rates.py` — AsyncCurrencyFetcher
+
+Fetches and parses HTML exchange rate tables.
+
+**Features:**
+- Uses `httpx` for async HTTP fetching
+- Uses `selectolax` for fast HTML parsing
+- Extracts currency codes from table headers
+- Parses rates into `CurrencyRateRecord` schema
+- Customizable base currency (default: USD)
+
+#### `compare_sitemap_exchange_rates.py` — run_delta_nexus_engine
+
+Imports the canonical scraper classes, orchestrates them asynchronously, and routes records through the message broker. Scraping and parsing logic remains in the source-specific modules.
+
+**Pipeline:**
+1. Start XML scraper task
+2. Fetch one currency-rate snapshot
+3. Validate records as they arrive
+4. Send to broker (stub or Kafka)
+5. Write CSV output and finish the run
+
+### Broker (`broker/`)
+
+The broker abstraction decouples scrapers from output sinks, enabling multiple backends without changing scraper code.
+
+#### `broker.py` — Abstract Interface
+
+Defines:
+- `MessageBrokerClient` (ABC)
+- `ProductPriceRecord` (Pydantic model)
+- `CurrencyRateRecord` (Pydantic model)
+
+#### `kafka_broker.py` — KafkaMessageBrokerClient
+
+Sends records to Kafka topics (default topics: `raw-prices`, `fx-rates`).
+
+**Methods:**
+- `connect()` — Initialize producer
+- `disconnect()` — Close producer
+- `send_price_data(record)` — Send to `raw-prices` topic
+- `send_currency_data(record)` — Send to `fx-rates` topic
+
+#### `kafka_consumer.py` — KafkaConsumerWriter
+
+Consumes records from Kafka and writes to CSV.
+
+**Methods:**
+- `start_consuming(timeout_seconds)` — Listen and write
+- `_write_csv_files()` — Persist records to disk
+
+## Usage
+
+### Mode 1: Stub Broker (Default)
+
+Records are logged and written to CSV immediately. Perfect for learning and one-off runs.
+
+```python
+import asyncio
+from sitemap_exchange_rate_processors import run_delta_nexus_engine
+
+asyncio.run(
+    run_delta_nexus_engine(
+        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
+        currency_url="https://www.floatrates.com/daily.html",
+        use_kafka=False  # default
+    )
+)
+```
+
+**Output:**
+- `scraped_product_prices.csv` — Product records
+- `processed_currency_rates.csv` — Exchange rate records
+
+### Mode 2: Kafka Producer + Consumer
+
+Scraper sends records to Kafka; consumer processes messages independently. Separates concerns and enables scaling.
+
+**Producer (sends data to Kafka):**
+```python
+import asyncio
+from sitemap_exchange_rate_processors import run_delta_nexus_engine
+
+asyncio.run(
+    run_delta_nexus_engine(
+        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
+        use_kafka=True,
+        kafka_servers="kafka-broker.example.com:9092"
+    )
+)
+```
+
+**Consumer (processes records from Kafka):**
+```python
+import asyncio
+from sitemap_exchange_rate_processors import consume_from_kafka
+
+asyncio.run(
+    consume_from_kafka(
+        bootstrap_servers="kafka-broker.example.com:9092",
+        timeout_seconds=120
+    )
+)
+```
+
+## API Reference
+
+### `run_delta_nexus_engine(...)`
+
+**Parameters:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `price_url` | str | required | XML feed or sitemap URL |
+| `currency_url` | str | `https://www.floatrates.com/daily.html` | Exchange rate page URL |
+| `output_dir` | str | `.` (current dir) | Where to write CSV files |
+| `use_kafka` | bool | `True` | Enable Kafka mode |
+| `kafka_servers` | str | `localhost:9092` | Kafka bootstrap servers |
+
+**Returns:** `dict` with keys `prices_count`, `rates_count`, `processing_time_seconds`
+
+**Example:**
+```python
+result = await run_delta_nexus_engine(
+    price_url="https://example.com/products.xml",
+    output_dir="./data"
+)
+print(f"Processed {result['prices_count']} products")
+```
+
+### `consume_from_kafka(...)`
+
+**Parameters:**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bootstrap_servers` | str | `localhost:9092` | Kafka broker address |
+| `price_topic` | str | `raw-prices` | Topic for product data |
+| `rate_topic` | str | `fx-rates` | Topic for rates |
+| `output_dir` | str | `.` | Where to write CSVs |
+| `timeout_seconds` | int | `60` | Max wait for messages |
+
+**Example:**
+```python
+await consume_from_kafka(
+    bootstrap_servers="kafka.prod:9092",
+    output_dir="./outputs",
+    timeout_seconds=300
+)
+```
+
+## Data Schemas
+
+### ProductPriceRecord
+
+```python
+{
+    "product_id": str,              # Required (min 1 char)
+    "product_name": str | None,     # Optional
+    "product_url": str | None,      # Optional
+    "source_url": str | None,       # Optional
+    "price": float,                 # Required (> 0)
+    "currency": str,                # Default: "USD"
+    "timestamp": datetime            # ISO 8601
+}
+```
+
+### CurrencyRateRecord
+
+```python
+{
+    "base_currency": str,           # e.g., "USD"
+    "target_currency": str,         # e.g., "EUR"
+    "rate": float,                  # Exchange rate
+    "timestamp": datetime            # ISO 8601 (default: now)
+}
+```
+
+## Installation
+
+```bash
+# Install package
+pip install -r requirements.txt
+
+# For Kafka mode, ensure aiokafka is installed
+pip install aiokafka
+```
+
+**Requirements:**
+- Python 3.9+
+- `httpx` — async HTTP client
+- `lxml` — XML parsing
+- `selectolax` — HTML parsing
+- `pydantic` — data validation
+- `aiokafka` — Kafka client (optional, for Kafka mode)
+
+## Kafka Deployment
+
+Delta Nexus expects Kafka to be running and accessible at the specified `bootstrap_servers` URL.
+
+**Topics:**
+- `raw-prices` — Product price records (JSON)
+- `fx-rates` — Exchange rate records (JSON)
+
+### Event Contract
+
+Kafka messages use a versioned JSON envelope with these shared fields:
+
+- `schema_version` - currently `1.0`
+- `event_type` - `product_price` or `currency_rate`
+- `emitted_at` - UTC timestamp when the event was published
+
+Required fields for product price events:
+
+- `product_id`
 - `price`
-- `timestamp`, `updated_at`, `last_updated`, or `pubDate`
+- `timestamp`
+
+Optional fields for product price events:
+
+- `product_name`
+- `product_url`
+- `source_url`
 - `currency`
 
-If a record passes validation, it becomes a `ProductPriceRecord`. The code also clears parsed XML nodes so memory stays under control while the stream is processed.
+Required fields for FX rate events:
 
-### Currency scraper
+- `base_currency`
+- `target_currency`
+- `rate`
+- `timestamp`
 
-The currency scraper uses `httpx` to fetch the page and `selectolax` to read the rate table. It then:
+Compatibility rules:
 
-- finds the currency codes in the table header
-- locates the row for the chosen base currency
-- extracts numeric rate values from the row
+- Consumers must accept messages with the current `schema_version` only.
+- New optional fields may be added without breaking existing consumers.
+- Required fields should not be removed or renamed without bumping `schema_version`.
+- Topic names are stable contract names and should be updated in producer and consumer together.
 
-Each parsed rate becomes a `CurrencyRateRecord`.
+**Deployment options:**
+- **Self-managed**: Kafka cluster on-premises or cloud VMs
+- **Managed services**: Confluent Cloud, AWS MSK, Azure Event Hubs, Google Cloud Pub/Sub
+- **Development**: Local Kafka instances via Docker or similar
 
-### Unified engine
+Ensure the broker and consumer have network access to your Kafka servers and topics are auto-created or pre-created.
 
-`run_delta_nexus_engine(...)` creates both collectors and runs them together with `asyncio.gather()`. The price scraper and rate scraper work at the same time, and each record is passed to the broker stub before being written to CSV.
+## Testing
 
-Right now the broker stub only logs records. That keeps the architecture ready for Kafka, RabbitMQ, or a database sink later without changing the scraping flow.
+Test the pipeline against live public data sources:
 
-## Testing notebook
+```python
+import asyncio
+from sitemap_exchange_rate_processors import run_delta_nexus_engine
 
-Use `Delta_Nexus_Testing.ipynb` to test the real flow on live public websites. The notebook:
+# Test stub mode
+await run_delta_nexus_engine(
+    price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml"
+)
+```
 
-- imports the project modules from `Code/`
-- pulls a live XML feed
-- runs `run_price_scraper(...)`
-- pulls the live FloatRates page
-- runs `FloatRatesScraper.get_rates(...)`
-- can also call `run_delta_nexus_engine(...)` directly so you can test the full pipeline in one place
+You can also test individual components:
+
+```python
+from sitemap_exchange_rate_processors.scrapers import AsyncPriceScraper, AsyncCurrencyFetcher
+
+# Test price scraper
+scraper = AsyncPriceScraper()
+async for record in scraper.stream_prices("https://example.com/products.xml"):
+    print(record)
+
+# Test currency fetcher
+fetcher = AsyncCurrencyFetcher("https://www.floatrates.com/")
+rates = await fetcher.fetch_rates("USD")
+```
+
+## Choosing Stub vs Kafka
+
+| Scenario | Mode | Why |
+|----------|------|-----|
+| Local development | Stub | Zero dependencies, instant CSV |
+| One-time data export | Stub | Simple, no infrastructure |
+| Production-oriented prototype | Kafka | Decouples producers and consumers |
+| Multiple consumers | Kafka | Each runs independently |
+| Higher-volume experiments | Kafka | Supports partitioned message processing; load testing is still required |
+
+## Output Formats
+
+When using stub mode or CSV consumer, records are written to CSV files:
+
+**Product prices:**
+```
+product_id,product_name,product_url,source_url,price,currency,timestamp
+```
+
+**Currency rates:**
+```
+base_currency,target_currency,rate,timestamp
+```
+
+In production, consider versioning output files with timestamps or checksums to preserve history.
+
+## Extending Delta Nexus
+
+### Custom Broker
+
+Implement `MessageBrokerClient` to send records to any sink:
+
+```python
+from sitemap_exchange_rate_processors import MessageBrokerClient, ProductPriceRecord
+
+class DatabaseBroker(MessageBrokerClient):
+    async def send_price_data(self, record: ProductPriceRecord) -> None:
+        # Write to your database
+        pass
+
+    async def send_currency_data(self, record: CurrencyRateRecord) -> None:
+        # Write to your database
+        pass
+```
+
+### Custom Consumer
+
+Extend `KafkaConsumerWriter` or implement a new consumer to handle Kafka messages differently.
+
+## Troubleshooting
+
+**"Connection refused" (Kafka)**
+- Verify Kafka broker is running and accessible at the specified `bootstrap_servers` address
+- Check network connectivity and firewall rules
+- Ensure broker port (default 9092) is exposed
+
+**No records produced**
+- Verify the source URL is accessible and returns valid data
+- Check scraper logs for validation errors
+- Ensure records match schema expectations
+
+**Consumer timeout with no messages**
+- Increase `timeout_seconds` parameter
+- Verify producer has sent records (check application logs)
+- Verify topic names match between producer and consumer
+- Check Kafka broker logs for errors
+
+## License
+
+See LICENSE file for details.
 
 ## Notes
 
-- The project name has been updated to Delta Nexus in the logs and documentation.
-- The code is still a prototype, so live URLs must be supplied when you run it.
-- The output CSV files are overwritten each time the unified runner completes.
+- Delta Nexus is a learning prototype and should not yet be treated as production-ready
+- Live URLs are required; feeds are not bundled
+- CSV files are overwritten each run (consider timestamping in production)
+- Kafka integration uses `aiokafka` for async support

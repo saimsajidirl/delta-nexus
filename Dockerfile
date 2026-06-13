@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "compare_sitemap_exchange_rates.py"]
+CMD ["python", "-m", "sitemap_exchange_rate_processors.scrapers.compare_sitemap_exchange_rates"]
