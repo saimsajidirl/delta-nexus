@@ -7,3 +7,5 @@ jupyter
 ipykernel
 aiokafka
 kafka-python
+fastapi
+uvicorn
