@@ -1,64 +1,143 @@
 # Delta Nexus
 
-Delta Nexus is a learning-focused Python data pipeline that scrapes live product
-price data and exchange-rate data, publishes validated events to Kafka, and
-processes those Kafka events into CSV outputs.
+Delta Nexus is a data engineering platform for scraping product prices and
+exchange rates, publishing validated events to Kafka, persisting them to
+PostgreSQL, and viewing session results in a React dashboard.
 
-The current working local flow is:
+The current application flow is:
 
 ```text
-FastAPI request
-    |
-    v
-Product scraper + FX scraper
-    |
-    v
-Kafka topics
-    |
-    v
-Kafka consumer
-    |
-    v
-CSV files
+React dashboard or API client
+    -> FastAPI
+    -> async product and FX scrapers
+    -> Kafka topics
+    -> Kafka consumer
+    -> PostgreSQL
+    -> React dashboard polling
 ```
 
-Kafka is the required message path. If Kafka cannot be reached or an event cannot
-be published, the pipeline fails instead of silently skipping the message.
+Kafka is the required event path. The API fails a run if it cannot scrape,
+publish to Kafka, or persist session data when using the dashboard endpoint.
 
-> Project status: Delta Nexus is a portfolio and learning project. It currently
-> demonstrates async scraping, schema validation, Kafka publishing, a FastAPI
-> trigger layer, Docker Compose infrastructure, and CSV persistence. It is not
-> production-ready yet. Production work would still need durable database
-> storage, retries, dead-letter handling, observability, security, deployment
-> automation, and broader integration tests.
+## Project Status
+
+Delta Nexus currently includes:
+
+- async scraping for product XML feeds and FloatRates-style exchange-rate pages
+- Pydantic event contracts
+- Kafka publishing and consuming
+- PostgreSQL persistence with idempotent processed-message tracking
+- a FastAPI control layer
+- a React/Vite dashboard
+- Docker Compose for the app, Kafka, and Kafka UI
+
+Remaining hardening includes managed secrets, retries, dead-letter handling,
+observability, migrations automation, stronger integration tests, deployment
+automation, and security review.
+
+## Stack
+
+| Layer | Technology |
+|---|---|
+| API | FastAPI, Uvicorn, Pydantic |
+| Scraping | httpx, lxml, selectolax |
+| Streaming | Kafka, aiokafka |
+| Storage | PostgreSQL, asyncpg |
+| Frontend | React, TypeScript, Vite |
+| Local orchestration | Docker Compose |
+
+## Repository Layout
+
+```text
+.
+|-- docker-compose.yml
+|-- Dockerfile
+|-- requirements-api.txt
+|-- Delta_Nexus_End_to_End_Test.ipynb
+|-- a_extra/
+|   |-- DATABASE_SCHEMA_DESIGN.md
+|   `-- database/
+|       |-- schema.sql
+|       `-- migrations/
+`-- sitemap_exchange_rate_processors/
+    |-- backend/
+    |   `-- connect_scraper_with_kafka.py
+    |-- broker/
+    |   |-- broker.py
+    |   |-- kafka_producer.py
+    |   `-- kafka_consumer.py
+    |-- consumers/
+    |   `-- postgres_consumer.py
+    |-- frontend/
+    |   |-- Dockerfile
+    |   |-- package.json
+    |   `-- src/
+    |-- scrapers/
+    `-- storage/
+```
+
+## Prerequisites
+
+- Docker Desktop
+- PostgreSQL 15 or newer
+- Python 3.12 if running Python modules outside Docker
+- Node.js 20 or newer if running the frontend outside Docker
+
+Docker Compose starts Kafka, Kafka UI, the FastAPI API, and the React frontend.
+It does not start PostgreSQL. Create the database locally and import the schema
+before using the dashboard session flow.
+
+## PostgreSQL Setup
+
+Create a local database named `delta_nexus_test`, then import the schema:
+
+```powershell
+psql -U postgres -d delta_nexus_test -f .\a_extra\database\schema.sql
+```
+
+Set a connection string for local Python commands:
+
+```powershell
+$env:DATABASE_URL="postgresql://postgres:<password>@localhost:5432/delta_nexus_test"
+$env:DATABASE_SCHEMA="delta_nexus"
+```
+
+For Docker Compose, set `DOCKER_DATABASE_URL` so the API container can reach the
+host PostgreSQL instance:
+
+```powershell
+$env:DOCKER_DATABASE_URL="postgresql://postgres:<password>@host.docker.internal:5432/delta_nexus_test"
+```
 
 ## Quick Start
 
-Start Docker Desktop first, then run the full local stack:
+Start Docker Desktop, make sure PostgreSQL is running, then start the app:
 
 ```powershell
 docker-compose up --build
 ```
 
-This starts:
-
-- ZooKeeper
-- Kafka
-- Kafka UI
-- FastAPI
-
 Open:
 
-```text
-FastAPI docs: http://localhost:8000/docs
-Health:       http://localhost:8000/health
-Kafka UI:     http://localhost:8080
-Kafka broker: localhost:9092
-```
+| Service | URL |
+|---|---|
+| React dashboard | http://localhost:5173 |
+| FastAPI docs | http://localhost:8000/docs |
+| API health | http://localhost:8000/health |
+| API readiness | http://localhost:8000/ready |
+| Kafka UI | http://localhost:8080 |
+| Kafka broker | localhost:9092 |
 
-## Run The Pipeline Through FastAPI
+In the dashboard, keep the default feed URL or enter another product XML feed,
+then select `START SCRAPE`. The dashboard creates a browser session id, runs a
+session-scoped pipeline, and polls persisted PostgreSQL rows every two seconds.
 
-Use the Swagger UI at `http://localhost:8000/docs`, or send a request directly:
+## API Usage
+
+### Basic Kafka Publish Run
+
+`POST /pipeline/run` scrapes product and FX data, then publishes events to Kafka.
+It does not persist rows to PostgreSQL by itself.
 
 ```powershell
 curl -X POST "http://localhost:8000/pipeline/run" `
@@ -66,197 +145,59 @@ curl -X POST "http://localhost:8000/pipeline/run" `
   -d '{
     "price_url": "https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
     "currency_url": "https://www.floatrates.com/",
+    "kafka_servers": "localhost:9092",
     "price_topic": "raw-prices",
     "rate_topic": "fx-rates",
     "base_currency": "USD"
   }'
 ```
 
-The FastAPI endpoint runs the scrapers and publishes events to Kafka. CSV writing
-is handled by the Kafka consumer.
+### Dashboard Session Run
 
-## Run The End-To-End Notebook
-
-After `docker-compose up --build` is running, open and run:
-
-[Delta_Nexus_End_to_End_Test.ipynb](Delta_Nexus_End_to_End_Test.ipynb)
-
-The notebook validates the working path:
-
-```text
-Notebook
-  -> FastAPI /pipeline/run
-  -> scrapers
-  -> Kafka
-  -> KafkaConsumerWriter
-  -> CSV
-```
-
-The notebook uses unique Kafka topics per run so old Kafka messages do not pollute
-the test result.
-
-## Connect To PostgreSQL
-
-Import the schema first:
-
-[database/schema.sql](database/schema.sql)
-
-The code reads the database connection from `DATABASE_URL`.
-
-For a local database named `delta_nexus_test` with user `postgres` and password
-`postgres`:
+`POST /sessions/{session_id}/pipeline/run` uses session-specific Kafka topics and
+starts a short-lived Kafka-to-Postgres consumer while the scrape runs.
 
 ```powershell
-$env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/delta_nexus_test"
+curl -X POST "http://localhost:8000/sessions/session_demo01/pipeline/run" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "price_url": "https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
+    "currency_url": "https://www.floatrates.com/",
+    "kafka_servers": "localhost:9092",
+    "base_currency": "USD",
+    "consumer_timeout_seconds": 60,
+    "persist_wait_seconds": 20
+  }'
 ```
 
-Check database readiness through FastAPI:
-
-```text
-http://localhost:8000/ready
-```
-
-Persist Kafka events into PostgreSQL:
+Fetch session data:
 
 ```powershell
-.\.venv\Scripts\python.exe -m sitemap_exchange_rate_processors.consumers.postgres_consumer `
-  --bootstrap-servers localhost:9092 `
-  --price-topic raw-prices `
-  --rate-topic fx-rates `
-  --database-url "postgresql://postgres:postgres@localhost:5432/delta_nexus_test" `
-  --timeout-seconds 120
+curl "http://localhost:8000/sessions/session_demo01/data?limit=100"
 ```
 
-When FastAPI runs inside Docker Compose and PostgreSQL runs locally on Windows,
-the API container reaches the host database through:
+Session topic names are deterministic:
 
 ```text
-host.docker.internal
+raw-prices-{session_id}
+fx-rates-{session_id}
 ```
 
-Update `DATABASE_URL` in `docker-compose.yml` if your local database password or
-database name is different.
-
-## Architecture
-
-### High-Level Flow
-
-```text
-Client / Notebook / Swagger UI
-    |
-    v
-FastAPI
-    |
-    v
-AsyncPriceScraper ------------------\
-                                     +--> KafkaProducerClient
-AsyncCurrencyFetcher ---------------/             |
-                                                   |
-                          +------------------------+------------------+
-                          |                                           |
-                          v                                           v
-                    raw-prices topic                            fx-rates topic
-                          |                                           |
-                          +------------------------+------------------+
-                                                   |
-                                                   v
-                                          KafkaConsumerWriter
-                                                   |
-                                                   v
-                                             CSV output files
-```
-
-### Docker Services
-
-| Service | Purpose | Local URL/Port |
-|---|---|---|
-| `zookeeper` | Kafka dependency | `localhost:2181` |
-| `kafka` | Event broker | `localhost:9092` |
-| `kafka-ui` | Kafka topic/message UI | `http://localhost:8080` |
-| `api` | FastAPI scraper trigger service | `http://localhost:8000` |
-
-Inside Docker, FastAPI connects to Kafka through `kafka:29092`. From your host
-machine, clients connect to Kafka through `localhost:9092`.
-
-## Project Structure
-
-```text
-sitemap_exchange_rate_processors/
-  backend/
-    connect_scraper_with_kafka.py      # FastAPI app
-  broker/
-    broker.py                          # Shared schemas and broker interface
-    kafka_producer.py                  # Kafka producer implementation
-    kafka_consumer.py                  # Kafka consumer + CSV writer
-  scrapers/
-    scrape_sitemaps.py                 # Product XML parsing
-    scrape_exchange_rates.py           # FX HTML parsing
-    compare_sitemap_exchange_rates.py  # Scraper orchestration helpers
-  __init__.py                          # Package exports
-
-docker-compose.yml                     # Kafka, Kafka UI, and FastAPI stack
-Dockerfile                             # FastAPI container image
-Delta_Nexus_End_to_End_Test.ipynb      # Working E2E notebook
-```
-
-## Components
-
-### FastAPI Backend
-
-Main file:
-
-```text
-sitemap_exchange_rate_processors/backend/connect_scraper_with_kafka.py
-```
-
-Endpoints:
+## API Endpoints
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | Service index |
 | `GET /health` | Confirms the API process is running |
-| `GET /config` | Shows safe runtime defaults |
-| `POST /pipeline/run` | Runs scrapers and publishes records to Kafka |
-
-`POST /pipeline/run` accepts:
-
-| Field | Description |
-|---|---|
-| `price_url` | XML product feed or sitemap URL |
-| `currency_url` | FloatRates-style exchange-rate page |
-| `kafka_servers` | Kafka bootstrap servers, defaults from environment |
-| `price_topic` | Kafka topic for product events |
-| `rate_topic` | Kafka topic for FX events |
-| `base_currency` | Base currency for exchange rates, default `USD` |
-
-### Scrapers
-
-`AsyncPriceScraper` downloads an XML feed and parses product records into the
-shared `ProductPriceRecord` schema.
-
-`AsyncCurrencyFetcher` downloads a FloatRates-style HTML page and parses exchange
-rates into the shared `CurrencyRateRecord` schema.
-
-### Kafka Producer
-
-`KafkaProducerClient` publishes validated events to Kafka topics:
-
-- `raw-prices`
-- `fx-rates`
-
-Each Kafka message is wrapped in a versioned JSON event envelope.
-
-### Kafka Consumer
-
-`KafkaConsumerWriter` consumes product and FX events from Kafka, validates the
-event schema, and writes CSV files:
-
-- `scraped_product_prices.csv`
-- `processed_currency_rates.csv`
+| `GET /ready` | Confirms PostgreSQL is reachable |
+| `GET /config` | Returns safe runtime defaults |
+| `POST /pipeline/run` | Scrapes and publishes to Kafka |
+| `POST /sessions/{session_id}/pipeline/run` | Scrapes, publishes, and persists for one dashboard session |
+| `GET /sessions/{session_id}/data` | Returns persisted rows and in-memory session logs |
 
 ## Event Contract
 
-Kafka messages include shared envelope fields:
+All Kafka messages include:
 
 ```text
 schema_version
@@ -285,125 +226,130 @@ rate
 timestamp
 ```
 
-Current schema version:
+Current schema version: `1.0`.
 
-```text
-1.0
-```
+## Running Locally Without Docker
 
-## Local Python Usage
-
-Install dependencies:
+Install Python dependencies:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-api.txt
 ```
 
-Run FastAPI locally without Docker:
+Run the API:
 
 ```powershell
 .\.venv\Scripts\uvicorn.exe sitemap_exchange_rate_processors.backend.connect_scraper_with_kafka:app --reload
 ```
 
-Run the Kafka consumer locally:
+Run the PostgreSQL Kafka consumer:
 
-```python
-import asyncio
-from sitemap_exchange_rate_processors import consume_from_kafka
-
-asyncio.run(
-    consume_from_kafka(
-        bootstrap_servers="localhost:9092",
-        output_dir="./outputs",
-        timeout_seconds=120,
-    )
-)
+```powershell
+.\.venv\Scripts\python.exe -m sitemap_exchange_rate_processors.consumers.postgres_consumer `
+  --bootstrap-servers localhost:9092 `
+  --price-topic raw-prices `
+  --rate-topic fx-rates `
+  --database-url "postgresql://postgres:<password>@localhost:5432/delta_nexus_test" `
+  --timeout-seconds 120
 ```
 
-## Output Format
+Run the CSV Kafka consumer:
 
-Product CSV:
+```powershell
+.\.venv\Scripts\python.exe -m sitemap_exchange_rate_processors.broker.kafka_consumer
+```
+
+Run the frontend locally:
+
+```powershell
+cd .\sitemap_exchange_rate_processors\frontend
+npm install
+npm run dev
+```
+
+## Docker Services
+
+| Service | Purpose | Host port |
+|---|---|---|
+| `zookeeper` | Kafka dependency | `2181` |
+| `kafka` | Event broker | `9092` |
+| `kafka-ui` | Kafka topic/message UI | `8080` |
+| `api` | FastAPI scraper control service | `8000` |
+| `frontend` | React dashboard served by nginx | `5173` |
+
+Inside Docker, the API uses Kafka at `kafka:29092`. Host tools use
+`localhost:9092`.
+
+## Output Paths
+
+The CSV consumer writes:
 
 ```text
-schema_version,event_type,emitted_at,product_id,product_name,product_url,source_url,price,currency,timestamp
+outputs/scraped_product_prices.csv
+outputs/processed_currency_rates.csv
 ```
 
-Currency CSV:
+The dashboard reads from PostgreSQL tables in the `delta_nexus` schema,
+especially:
 
 ```text
-schema_version,event_type,emitted_at,base_currency,target_currency,rate,timestamp
+products
+product_price_observations
+exchange_rate_pairs
+exchange_rate_observations
+kafka_processed_messages
 ```
+
+## Notebook
+
+The end-to-end notebook is available at:
+
+```text
+Delta_Nexus_End_to_End_Test.ipynb
+```
+
+Run the Docker stack first, then execute the notebook to exercise the API,
+Kafka, consumers, and persistence path.
 
 ## Troubleshooting
 
-### Docker cannot connect to the Docker API
+### `/ready` returns 503
 
-Start Docker Desktop and wait until it says the engine is running. Then retry:
+PostgreSQL is not reachable from the API process. Confirm the database exists,
+the schema has been imported, and `DATABASE_URL` or `DOCKER_DATABASE_URL` uses
+the right password and host.
 
-```powershell
-docker-compose up --build
-```
+### Dashboard shows a Postgres or pipeline error
 
-### ZooKeeper is unhealthy
-
-The Compose file uses the `srvr` command for ZooKeeper health checks because this
-image enables `srvr`. If an older container is still running, restart the stack:
+The dashboard calls the session endpoint, which requires Kafka and PostgreSQL.
+Check:
 
 ```powershell
-docker-compose down
-docker-compose up --build
+docker-compose ps
+docker-compose logs api
 ```
 
 ### Kafka is unavailable
 
-Check that the stack is running:
+Wait for the Kafka health check to pass, then verify the host broker:
 
 ```powershell
 docker-compose ps
 ```
 
-Kafka should be available from the host at:
+Host clients should use `localhost:9092`. Containers should use `kafka:29092`.
+
+### No rows appear in the dashboard
+
+Make sure the session endpoint completed successfully and that the API container
+can connect to PostgreSQL through `host.docker.internal`.
+
+### Frontend cannot reach the API
+
+The Compose frontend image is built with:
 
 ```text
-localhost:9092
+VITE_API_BASE_URL=http://localhost:8000
 ```
 
-FastAPI should use this Docker-internal address when running inside Compose:
-
-```text
-kafka:29092
-```
-
-### FastAPI is unavailable
-
-Check:
-
-```text
-http://localhost:8000/health
-```
-
-If it does not respond, inspect the API logs:
-
-```powershell
-docker-compose logs api
-```
-
-### No CSV files are written
-
-Make sure the Kafka consumer is running. The FastAPI endpoint only scrapes and
-publishes to Kafka. CSV persistence happens when `KafkaConsumerWriter` consumes
-events from Kafka.
-
-The notebook starts its own consumer and writes to a temporary output directory.
-
-## Roadmap
-
-The next architecture step is durable storage and search:
-
-- PostgreSQL as the source of truth
-- Elasticsearch as a rebuildable search index
-- FastAPI endpoints backed by PostgreSQL and Elasticsearch
-
-See:
-
-[POSTGRES_ELASTICSEARCH_DATABASE_ARCHITECTURE.md](POSTGRES_ELASTICSEARCH_DATABASE_ARCHITECTURE.md)
+If you change the API port or host, rebuild the frontend container.
