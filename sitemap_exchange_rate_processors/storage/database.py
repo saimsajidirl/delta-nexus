@@ -151,6 +151,78 @@ class PostgresStorage:
             )
         return int(count or 0)
 
+    async def list_product_observations_for_topic(
+        self,
+        topic: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return recent product price rows persisted from one Kafka topic."""
+        if not self.pool:
+            await self.connect()
+
+        row_limit = max(1, min(limit, 500))
+        assert self.pool is not None
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT
+                    p.external_product_id AS product_id,
+                    p.product_name,
+                    p.product_url,
+                    o.price,
+                    o.currency_code::text AS currency,
+                    o.observed_at,
+                    o.emitted_at,
+                    o.created_at,
+                    o.kafka_topic
+                FROM product_price_observations o
+                JOIN products p
+                    ON p.product_pk = o.product_pk
+                WHERE o.kafka_topic = $1
+                ORDER BY o.created_at DESC
+                LIMIT $2
+                """,
+                topic,
+                row_limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def list_exchange_rate_observations_for_topic(
+        self,
+        topic: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return recent exchange-rate rows persisted from one Kafka topic."""
+        if not self.pool:
+            await self.connect()
+
+        row_limit = max(1, min(limit, 500))
+        assert self.pool is not None
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT
+                    p.base_currency_code::text AS base_currency,
+                    p.target_currency_code::text AS target_currency,
+                    o.rate,
+                    o.observed_at,
+                    o.emitted_at,
+                    o.created_at,
+                    o.kafka_topic
+                FROM exchange_rate_observations o
+                JOIN exchange_rate_pairs p
+                    ON p.exchange_rate_pair_id = o.exchange_rate_pair_id
+                WHERE o.kafka_topic = $1
+                ORDER BY o.created_at DESC
+                LIMIT $2
+                """,
+                topic,
+                row_limit,
+            )
+        return [dict(row) for row in rows]
+
     async def count_recent_exchange_rate_observations_for_topic(
         self,
         topic: str,
