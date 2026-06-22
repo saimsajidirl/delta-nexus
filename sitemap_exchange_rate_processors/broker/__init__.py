@@ -11,8 +11,8 @@ from .broker import (
     CurrencyRateRecord,
     SCHEMA_VERSION,
 )
-from .kafka_broker import KafkaMessageBrokerClient
 from .kafka_consumer import KafkaConsumerWriter, consume_from_kafka
+from .kafka_producer import KafkaProducerClient
 
 __all__ = [
     "MessageBrokerClient",
@@ -24,7 +24,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "PRICE_TOPIC",
     "FX_TOPIC",
-    "KafkaMessageBrokerClient",
+    "KafkaProducerClient",
     "KafkaConsumerWriter",
     "consume_from_kafka",
 ]

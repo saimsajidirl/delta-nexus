@@ -1,461 +1,355 @@
 # Delta Nexus
 
-Delta Nexus is a learning-focused Python data pipeline that fetches and processes data from two public sources:
+Delta Nexus is a data engineering platform for scraping product prices and
+exchange rates, publishing validated events to Kafka, persisting them to
+PostgreSQL, and viewing session results in a React dashboard.
 
-1. **Product data**: XML feeds or sitemap URLs
-2. **Currency rates**: Live exchange rate pages (FloatRates-style HTML)
+The current application flow is:
 
-The pipeline decouples data collection from processing using Kafka as the default message path.
-For local experiments, a stub broker is also available without external infrastructure.
+```text
+React dashboard or API client
+    -> FastAPI
+    -> async product and FX scrapers
+    -> Kafka topics
+    -> Kafka consumer
+    -> PostgreSQL
+    -> React dashboard polling
+```
 
-> **Project status:** Delta Nexus is an evolving portfolio and learning project. It demonstrates async collection, validated event contracts, Kafka integration, and CSV persistence, but it is not yet production-ready. Production use still requires durable storage, retries and dead-letter handling, observability, security, deployment automation, and broader integration/load testing.
+Kafka is the required event path. The API fails a run if it cannot scrape,
+publish to Kafka, or persist session data when using the dashboard endpoint.
+
+## Project Status
+
+Delta Nexus currently includes:
+
+- async scraping for product XML feeds and FloatRates-style exchange-rate pages
+- Pydantic event contracts
+- Kafka publishing and consuming
+- PostgreSQL persistence with idempotent processed-message tracking
+- a FastAPI control layer
+- a React/Vite dashboard
+- Docker Compose for the app, Kafka, and Kafka UI
+
+Remaining hardening includes managed secrets, retries, dead-letter handling,
+observability, migrations automation, stronger integration tests, deployment
+automation, and security review.
+
+## Stack
+
+| Layer | Technology |
+|---|---|
+| API | FastAPI, Uvicorn, Pydantic |
+| Scraping | httpx, lxml, selectolax |
+| Streaming | Kafka, aiokafka |
+| Storage | PostgreSQL, asyncpg |
+| Frontend | React, TypeScript, Vite |
+| Local orchestration | Docker Compose |
+
+## Repository Layout
+
+```text
+.
+|-- docker-compose.yml
+|-- Dockerfile
+|-- requirements-api.txt
+|-- Delta_Nexus_End_to_End_Test.ipynb
+|-- a_extra/
+|   |-- DATABASE_SCHEMA_DESIGN.md
+|   `-- database/
+|       |-- schema.sql
+|       `-- migrations/
+`-- sitemap_exchange_rate_processors/
+    |-- backend/
+    |   `-- connect_scraper_with_kafka.py
+    |-- broker/
+    |   |-- broker.py
+    |   |-- kafka_producer.py
+    |   `-- kafka_consumer.py
+    |-- consumers/
+    |   `-- postgres_consumer.py
+    |-- frontend/
+    |   |-- Dockerfile
+    |   |-- package.json
+    |   `-- src/
+    |-- scrapers/
+    `-- storage/
+```
+
+## Prerequisites
+
+- Docker Desktop
+- PostgreSQL 15 or newer
+- Python 3.12 if running Python modules outside Docker
+- Node.js 20 or newer if running the frontend outside Docker
+
+Docker Compose starts Kafka, Kafka UI, the FastAPI API, and the React frontend.
+It does not start PostgreSQL. Create the database locally and import the schema
+before using the dashboard session flow.
+
+## PostgreSQL Setup
+
+Create a local database named `delta_nexus_test`, then import the schema:
+
+```powershell
+psql -U postgres -d delta_nexus_test -f .\a_extra\database\schema.sql
+```
+
+Set a connection string for local Python commands:
+
+```powershell
+$env:DATABASE_URL="postgresql://postgres:<password>@localhost:5432/delta_nexus_test"
+$env:DATABASE_SCHEMA="delta_nexus"
+```
+
+For Docker Compose, set `DOCKER_DATABASE_URL` so the API container can reach the
+host PostgreSQL instance:
+
+```powershell
+$env:DOCKER_DATABASE_URL="postgresql://postgres:<password>@host.docker.internal:5432/delta_nexus_test"
+```
 
 ## Quick Start
 
-### Stub Mode (No External Dependencies)
+Start Docker Desktop, make sure PostgreSQL is running, then start the app:
 
-```python
-import asyncio
-from sitemap_exchange_rate_processors import run_delta_nexus_engine
-
-asyncio.run(
-    run_delta_nexus_engine(
-        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
-        currency_url="https://www.floatrates.com/daily.html"
-    )
-)
+```powershell
+docker-compose up --build
 ```
 
-Records are logged and written to CSV files in the specified output directory.
+Open:
 
-### Kafka Mode (Decoupled Message Path)
+| Service | URL |
+|---|---|
+| React dashboard | http://localhost:5173 |
+| FastAPI docs | http://localhost:8000/docs |
+| API health | http://localhost:8000/health |
+| API readiness | http://localhost:8000/ready |
+| Kafka UI | http://localhost:8080 |
+| Kafka broker | localhost:9092 |
 
-```python
-import asyncio
-from sitemap_exchange_rate_processors import run_delta_nexus_engine
+In the dashboard, keep the default feed URL or enter another product XML feed,
+then select `START SCRAPE`. The dashboard creates a browser session id, runs a
+session-scoped pipeline, and polls persisted PostgreSQL rows every two seconds.
 
-asyncio.run(
-    run_delta_nexus_engine(
-        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
-        use_kafka=True,
-        kafka_servers="kafka-broker.example.com:9092"
-    )
-)
+## API Usage
+
+### Basic Kafka Publish Run
+
+`POST /pipeline/run` scrapes product and FX data, then publishes events to Kafka.
+It does not persist rows to PostgreSQL by itself.
+
+```powershell
+curl -X POST "http://localhost:8000/pipeline/run" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "price_url": "https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
+    "currency_url": "https://www.floatrates.com/",
+    "kafka_servers": "localhost:9092",
+    "price_topic": "raw-prices",
+    "rate_topic": "fx-rates",
+    "base_currency": "USD"
+  }'
 ```
 
-Kafka decouples collection from downstream processing and allows independent consumer groups. The current project is a single-node development setup, not a benchmarked real-time deployment.
+### Dashboard Session Run
 
-## Architecture
+`POST /sessions/{session_id}/pipeline/run` uses session-specific Kafka topics and
+starts a short-lived Kafka-to-Postgres consumer while the scrape runs.
 
-### High-Level Flow
-
-```
-┌─────────────────────────────────────────┐
-│      Delta Nexus Scrapers               │
-│  - XML Product Scraper (sitemap)        │
-│  - Currency Rate Fetcher (HTML table)   │
-└──────────────┬──────────────────────────┘
-               │ (records)
-               ▼
-    ┌──────────────────────┐
-    │  Message Broker      │
-    │  (Abstract Interface)│
-    └──┬──────────────┬────┘
-       │              │
-   (Stub)        (Kafka)
-       │              │
-       ▼              ▼
-    CSV Files    Kafka Topics
-    (immediate)  (async)
-                    │
-                    ▼
-            ┌───────────────┐
-            │ Consumers     │
-            │ - CSV Writer  │
-            │ - Database    │
-            │ - Alerts      │
-            │ - Analytics   │
-            └───────────────┘
+```powershell
+curl -X POST "http://localhost:8000/sessions/session_demo01/pipeline/run" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "price_url": "https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
+    "currency_url": "https://www.floatrates.com/",
+    "kafka_servers": "localhost:9092",
+    "base_currency": "USD",
+    "consumer_timeout_seconds": 60,
+    "persist_wait_seconds": 20
+  }'
 ```
 
-### Project Structure
+Fetch session data:
 
-```
-sitemap_exchange_rate_processors/
-├── scrapers/
-│   ├── scrape_sitemaps.py           # XML parsing + validation
-│   ├── scrape_exchange_rates.py     # HTML table parsing
-│   └── compare_sitemap_exchange_rates.py  # Unified orchestrator
-├── broker/
-│   ├── broker.py                    # Abstract broker interface
-│   ├── kafka_broker.py              # Kafka producer implementation
-│   └── kafka_consumer.py            # Kafka consumer + CSV writer
-└── __init__.py                      # Package exports
+```powershell
+curl "http://localhost:8000/sessions/session_demo01/data?limit=100"
 ```
 
-## Components
+Session topic names are deterministic:
 
-### Scrapers (`scrapers/`)
-
-#### `scrape_sitemaps.py` — AsyncPriceScraper
-
-Downloads an XML feed and parses its product elements incrementally using `lxml.etree.iterparse()`. The parser clears processed nodes, although the HTTP response is currently buffered before parsing.
-
-**Features:**
-- Extracts `product_id`, `product_name`, `product_url`, `price`, `currency`, `timestamp`
-- Flexible field mapping: recognizes `id`, `sku`, `item_id`, `product_id`
-- Clears parsed XML nodes to limit parser memory growth
-- Validates data into `ProductPriceRecord` schema (Pydantic)
-
-#### `scrape_exchange_rates.py` — AsyncCurrencyFetcher
-
-Fetches and parses HTML exchange rate tables.
-
-**Features:**
-- Uses `httpx` for async HTTP fetching
-- Uses `selectolax` for fast HTML parsing
-- Extracts currency codes from table headers
-- Parses rates into `CurrencyRateRecord` schema
-- Customizable base currency (default: USD)
-
-#### `compare_sitemap_exchange_rates.py` — run_delta_nexus_engine
-
-Imports the canonical scraper classes, orchestrates them asynchronously, and routes records through the message broker. Scraping and parsing logic remains in the source-specific modules.
-
-**Pipeline:**
-1. Start XML scraper task
-2. Fetch one currency-rate snapshot
-3. Validate records as they arrive
-4. Send to broker (stub or Kafka)
-5. Write CSV output and finish the run
-
-### Broker (`broker/`)
-
-The broker abstraction decouples scrapers from output sinks, enabling multiple backends without changing scraper code.
-
-#### `broker.py` — Abstract Interface
-
-Defines:
-- `MessageBrokerClient` (ABC)
-- `ProductPriceRecord` (Pydantic model)
-- `CurrencyRateRecord` (Pydantic model)
-
-#### `kafka_broker.py` — KafkaMessageBrokerClient
-
-Sends records to Kafka topics (default topics: `raw-prices`, `fx-rates`).
-
-**Methods:**
-- `connect()` — Initialize producer
-- `disconnect()` — Close producer
-- `send_price_data(record)` — Send to `raw-prices` topic
-- `send_currency_data(record)` — Send to `fx-rates` topic
-
-#### `kafka_consumer.py` — KafkaConsumerWriter
-
-Consumes records from Kafka and writes to CSV.
-
-**Methods:**
-- `start_consuming(timeout_seconds)` — Listen and write
-- `_write_csv_files()` — Persist records to disk
-
-## Usage
-
-### Mode 1: Stub Broker (Default)
-
-Records are logged and written to CSV immediately. Perfect for learning and one-off runs.
-
-```python
-import asyncio
-from sitemap_exchange_rate_processors import run_delta_nexus_engine
-
-asyncio.run(
-    run_delta_nexus_engine(
-        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
-        currency_url="https://www.floatrates.com/daily.html",
-        use_kafka=False  # default
-    )
-)
+```text
+raw-prices-{session_id}
+fx-rates-{session_id}
 ```
 
-**Output:**
-- `scraped_product_prices.csv` — Product records
-- `processed_currency_rates.csv` — Exchange rate records
+## API Endpoints
 
-### Mode 2: Kafka Producer + Consumer
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | Service index |
+| `GET /health` | Confirms the API process is running |
+| `GET /ready` | Confirms PostgreSQL is reachable |
+| `GET /config` | Returns safe runtime defaults |
+| `POST /pipeline/run` | Scrapes and publishes to Kafka |
+| `POST /sessions/{session_id}/pipeline/run` | Scrapes, publishes, and persists for one dashboard session |
+| `GET /sessions/{session_id}/data` | Returns persisted rows and in-memory session logs |
 
-Scraper sends records to Kafka; consumer processes messages independently. Separates concerns and enables scaling.
+## Event Contract
 
-**Producer (sends data to Kafka):**
-```python
-import asyncio
-from sitemap_exchange_rate_processors import run_delta_nexus_engine
+All Kafka messages include:
 
-asyncio.run(
-    run_delta_nexus_engine(
-        price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml",
-        use_kafka=True,
-        kafka_servers="kafka-broker.example.com:9092"
-    )
-)
+```text
+schema_version
+event_type
+emitted_at
 ```
 
-**Consumer (processes records from Kafka):**
-```python
-import asyncio
-from sitemap_exchange_rate_processors import consume_from_kafka
+Product price events include:
 
-asyncio.run(
-    consume_from_kafka(
-        bootstrap_servers="kafka-broker.example.com:9092",
-        timeout_seconds=120
-    )
-)
+```text
+product_id
+product_name
+product_url
+source_url
+price
+currency
+timestamp
 ```
 
-## API Reference
+Currency-rate events include:
 
-### `run_delta_nexus_engine(...)`
-
-**Parameters:**
-
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `price_url` | str | required | XML feed or sitemap URL |
-| `currency_url` | str | `https://www.floatrates.com/daily.html` | Exchange rate page URL |
-| `output_dir` | str | `.` (current dir) | Where to write CSV files |
-| `use_kafka` | bool | `True` | Enable Kafka mode |
-| `kafka_servers` | str | `localhost:9092` | Kafka bootstrap servers |
-
-**Returns:** `dict` with keys `prices_count`, `rates_count`, `processing_time_seconds`
-
-**Example:**
-```python
-result = await run_delta_nexus_engine(
-    price_url="https://example.com/products.xml",
-    output_dir="./data"
-)
-print(f"Processed {result['prices_count']} products")
+```text
+base_currency
+target_currency
+rate
+timestamp
 ```
 
-### `consume_from_kafka(...)`
+Current schema version: `1.0`.
 
-**Parameters:**
+## Running Locally Without Docker
 
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `bootstrap_servers` | str | `localhost:9092` | Kafka broker address |
-| `price_topic` | str | `raw-prices` | Topic for product data |
-| `rate_topic` | str | `fx-rates` | Topic for rates |
-| `output_dir` | str | `.` | Where to write CSVs |
-| `timeout_seconds` | int | `60` | Max wait for messages |
+Install Python dependencies:
 
-**Example:**
-```python
-await consume_from_kafka(
-    bootstrap_servers="kafka.prod:9092",
-    output_dir="./outputs",
-    timeout_seconds=300
-)
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-api.txt
 ```
 
-## Data Schemas
+Run the API:
 
-### ProductPriceRecord
-
-```python
-{
-    "product_id": str,              # Required (min 1 char)
-    "product_name": str | None,     # Optional
-    "product_url": str | None,      # Optional
-    "source_url": str | None,       # Optional
-    "price": float,                 # Required (> 0)
-    "currency": str,                # Default: "USD"
-    "timestamp": datetime            # ISO 8601
-}
+```powershell
+.\.venv\Scripts\uvicorn.exe sitemap_exchange_rate_processors.backend.connect_scraper_with_kafka:app --reload
 ```
 
-### CurrencyRateRecord
+Run the PostgreSQL Kafka consumer:
 
-```python
-{
-    "base_currency": str,           # e.g., "USD"
-    "target_currency": str,         # e.g., "EUR"
-    "rate": float,                  # Exchange rate
-    "timestamp": datetime            # ISO 8601 (default: now)
-}
+```powershell
+.\.venv\Scripts\python.exe -m sitemap_exchange_rate_processors.consumers.postgres_consumer `
+  --bootstrap-servers localhost:9092 `
+  --price-topic raw-prices `
+  --rate-topic fx-rates `
+  --database-url "postgresql://postgres:<password>@localhost:5432/delta_nexus_test" `
+  --timeout-seconds 120
 ```
 
-## Installation
+Run the CSV Kafka consumer:
 
-```bash
-# Install package
-pip install -r requirements.txt
-
-# For Kafka mode, ensure aiokafka is installed
-pip install aiokafka
+```powershell
+.\.venv\Scripts\python.exe -m sitemap_exchange_rate_processors.broker.kafka_consumer
 ```
 
-**Requirements:**
-- Python 3.9+
-- `httpx` — async HTTP client
-- `lxml` — XML parsing
-- `selectolax` — HTML parsing
-- `pydantic` — data validation
-- `aiokafka` — Kafka client (optional, for Kafka mode)
+Run the frontend locally:
 
-## Kafka Deployment
-
-Delta Nexus expects Kafka to be running and accessible at the specified `bootstrap_servers` URL.
-
-**Topics:**
-- `raw-prices` — Product price records (JSON)
-- `fx-rates` — Exchange rate records (JSON)
-
-### Event Contract
-
-Kafka messages use a versioned JSON envelope with these shared fields:
-
-- `schema_version` - currently `1.0`
-- `event_type` - `product_price` or `currency_rate`
-- `emitted_at` - UTC timestamp when the event was published
-
-Required fields for product price events:
-
-- `product_id`
-- `price`
-- `timestamp`
-
-Optional fields for product price events:
-
-- `product_name`
-- `product_url`
-- `source_url`
-- `currency`
-
-Required fields for FX rate events:
-
-- `base_currency`
-- `target_currency`
-- `rate`
-- `timestamp`
-
-Compatibility rules:
-
-- Consumers must accept messages with the current `schema_version` only.
-- New optional fields may be added without breaking existing consumers.
-- Required fields should not be removed or renamed without bumping `schema_version`.
-- Topic names are stable contract names and should be updated in producer and consumer together.
-
-**Deployment options:**
-- **Self-managed**: Kafka cluster on-premises or cloud VMs
-- **Managed services**: Confluent Cloud, AWS MSK, Azure Event Hubs, Google Cloud Pub/Sub
-- **Development**: Local Kafka instances via Docker or similar
-
-Ensure the broker and consumer have network access to your Kafka servers and topics are auto-created or pre-created.
-
-## Testing
-
-Test the pipeline against live public data sources:
-
-```python
-import asyncio
-from sitemap_exchange_rate_processors import run_delta_nexus_engine
-
-# Test stub mode
-await run_delta_nexus_engine(
-    price_url="https://feeds.datafeedwatch.com/25986/cbdd197d9c7747c13f08f840f8bc76eb350292fc.xml"
-)
+```powershell
+cd .\sitemap_exchange_rate_processors\frontend
+npm install
+npm run dev
 ```
 
-You can also test individual components:
+## Docker Services
 
-```python
-from sitemap_exchange_rate_processors.scrapers import AsyncPriceScraper, AsyncCurrencyFetcher
+| Service | Purpose | Host port |
+|---|---|---|
+| `zookeeper` | Kafka dependency | `2181` |
+| `kafka` | Event broker | `9092` |
+| `kafka-ui` | Kafka topic/message UI | `8080` |
+| `api` | FastAPI scraper control service | `8000` |
+| `frontend` | React dashboard served by nginx | `5173` |
 
-# Test price scraper
-scraper = AsyncPriceScraper()
-async for record in scraper.stream_prices("https://example.com/products.xml"):
-    print(record)
+Inside Docker, the API uses Kafka at `kafka:29092`. Host tools use
+`localhost:9092`.
 
-# Test currency fetcher
-fetcher = AsyncCurrencyFetcher("https://www.floatrates.com/")
-rates = await fetcher.fetch_rates("USD")
+## Output Paths
+
+The CSV consumer writes:
+
+```text
+outputs/scraped_product_prices.csv
+outputs/processed_currency_rates.csv
 ```
 
-## Choosing Stub vs Kafka
+The dashboard reads from PostgreSQL tables in the `delta_nexus` schema,
+especially:
 
-| Scenario | Mode | Why |
-|----------|------|-----|
-| Local development | Stub | Zero dependencies, instant CSV |
-| One-time data export | Stub | Simple, no infrastructure |
-| Production-oriented prototype | Kafka | Decouples producers and consumers |
-| Multiple consumers | Kafka | Each runs independently |
-| Higher-volume experiments | Kafka | Supports partitioned message processing; load testing is still required |
-
-## Output Formats
-
-When using stub mode or CSV consumer, records are written to CSV files:
-
-**Product prices:**
-```
-product_id,product_name,product_url,source_url,price,currency,timestamp
+```text
+products
+product_price_observations
+exchange_rate_pairs
+exchange_rate_observations
+kafka_processed_messages
 ```
 
-**Currency rates:**
-```
-base_currency,target_currency,rate,timestamp
-```
+## Notebook
 
-In production, consider versioning output files with timestamps or checksums to preserve history.
+The end-to-end notebook is available at:
 
-## Extending Delta Nexus
-
-### Custom Broker
-
-Implement `MessageBrokerClient` to send records to any sink:
-
-```python
-from sitemap_exchange_rate_processors import MessageBrokerClient, ProductPriceRecord
-
-class DatabaseBroker(MessageBrokerClient):
-    async def send_price_data(self, record: ProductPriceRecord) -> None:
-        # Write to your database
-        pass
-
-    async def send_currency_data(self, record: CurrencyRateRecord) -> None:
-        # Write to your database
-        pass
+```text
+Delta_Nexus_End_to_End_Test.ipynb
 ```
 
-### Custom Consumer
-
-Extend `KafkaConsumerWriter` or implement a new consumer to handle Kafka messages differently.
+Run the Docker stack first, then execute the notebook to exercise the API,
+Kafka, consumers, and persistence path.
 
 ## Troubleshooting
 
-**"Connection refused" (Kafka)**
-- Verify Kafka broker is running and accessible at the specified `bootstrap_servers` address
-- Check network connectivity and firewall rules
-- Ensure broker port (default 9092) is exposed
+### `/ready` returns 503
 
-**No records produced**
-- Verify the source URL is accessible and returns valid data
-- Check scraper logs for validation errors
-- Ensure records match schema expectations
+PostgreSQL is not reachable from the API process. Confirm the database exists,
+the schema has been imported, and `DATABASE_URL` or `DOCKER_DATABASE_URL` uses
+the right password and host.
 
-**Consumer timeout with no messages**
-- Increase `timeout_seconds` parameter
-- Verify producer has sent records (check application logs)
-- Verify topic names match between producer and consumer
-- Check Kafka broker logs for errors
+### Dashboard shows a Postgres or pipeline error
 
-## License
+The dashboard calls the session endpoint, which requires Kafka and PostgreSQL.
+Check:
 
-See LICENSE file for details.
+```powershell
+docker-compose ps
+docker-compose logs api
+```
 
-## Notes
+### Kafka is unavailable
 
-- Delta Nexus is a learning prototype and should not yet be treated as production-ready
-- Live URLs are required; feeds are not bundled
-- CSV files are overwritten each run (consider timestamping in production)
-- Kafka integration uses `aiokafka` for async support
+Wait for the Kafka health check to pass, then verify the host broker:
+
+```powershell
+docker-compose ps
+```
+
+Host clients should use `localhost:9092`. Containers should use `kafka:29092`.
+
+### No rows appear in the dashboard
+
+Make sure the session endpoint completed successfully and that the API container
+can connect to PostgreSQL through `host.docker.internal`.
+
+### Frontend cannot reach the API
+
+The Compose frontend image is built with:
+
+```text
+VITE_API_BASE_URL=http://localhost:8000
+```
+
+If you change the API port or host, rebuild the frontend container.

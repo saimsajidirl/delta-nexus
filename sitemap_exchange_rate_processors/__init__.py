@@ -9,8 +9,8 @@ from .broker import (
     ProductPriceEvent,
     ProductPriceRecord,
     CurrencyRateRecord,
-    KafkaMessageBrokerClient,
     KafkaConsumerWriter,
+    KafkaProducerClient,
     consume_from_kafka,
     SCHEMA_VERSION,
 )
@@ -32,7 +32,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "PRICE_TOPIC",
     "FX_TOPIC",
-    "KafkaMessageBrokerClient",
+    "KafkaProducerClient",
     "KafkaConsumerWriter",
     "consume_from_kafka",
     "run_delta_nexus_engine",

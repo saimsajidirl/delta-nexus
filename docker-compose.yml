@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -9,7 +7,7 @@ services:
     ports:
       - "2181:2181"
     healthcheck:
-      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep Mode"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -47,3 +45,27 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+  api:
+    build: .
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      OUTPUT_DIR: /app/outputs
+      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgresql://postgres:saimpersonal@host.docker.internal:5432/delta_nexus_test}
+    volumes:
+      - ./outputs:/app/outputs
+
+  frontend:
+    build:
+      context: ./sitemap_exchange_rate_processors/frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    depends_on:
+      - api
+    ports:
+      - "5173:80"

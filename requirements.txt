@@ -1,9 +1,0 @@
-httpx
-loguru
-pydantic
-selectolax
-lxml
-jupyter
-ipykernel
-aiokafka
-kafka-python
