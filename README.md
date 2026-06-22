@@ -95,6 +95,48 @@ Notebook
 The notebook uses unique Kafka topics per run so old Kafka messages do not pollute
 the test result.
 
+## Connect To PostgreSQL
+
+Import the schema first:
+
+[database/schema.sql](database/schema.sql)
+
+The code reads the database connection from `DATABASE_URL`.
+
+For a local database named `delta_nexus_test` with user `postgres` and password
+`postgres`:
+
+```powershell
+$env:DATABASE_URL="postgresql://postgres:postgres@localhost:5432/delta_nexus_test"
+```
+
+Check database readiness through FastAPI:
+
+```text
+http://localhost:8000/ready
+```
+
+Persist Kafka events into PostgreSQL:
+
+```powershell
+.\.venv\Scripts\python.exe -m sitemap_exchange_rate_processors.consumers.postgres_consumer `
+  --bootstrap-servers localhost:9092 `
+  --price-topic raw-prices `
+  --rate-topic fx-rates `
+  --database-url "postgresql://postgres:postgres@localhost:5432/delta_nexus_test" `
+  --timeout-seconds 120
+```
+
+When FastAPI runs inside Docker Compose and PostgreSQL runs locally on Windows,
+the API container reaches the host database through:
+
+```text
+host.docker.internal
+```
+
+Update `DATABASE_URL` in `docker-compose.yml` if your local database password or
+database name is different.
+
 ## Architecture
 
 ### High-Level Flow
@@ -365,4 +407,3 @@ The next architecture step is durable storage and search:
 See:
 
 [POSTGRES_ELASTICSEARCH_DATABASE_ARCHITECTURE.md](POSTGRES_ELASTICSEARCH_DATABASE_ARCHITECTURE.md)
-

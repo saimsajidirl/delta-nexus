@@ -7,8 +7,8 @@ ENV PYTHONUNBUFFERED=1
 ENV KAFKA_BOOTSTRAP_SERVERS=kafka:29092
 ENV OUTPUT_DIR=/app/outputs
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-api.txt .
+RUN pip install --no-cache-dir -r requirements-api.txt
 
 COPY . .
 

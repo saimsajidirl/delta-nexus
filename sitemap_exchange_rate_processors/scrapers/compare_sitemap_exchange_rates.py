@@ -19,10 +19,26 @@ DEFAULT_BASE_CURRENCY: str = "USD"
 
 async def run_price_task(scraper: AsyncPriceScraper, url: str, broker: MessageBrokerClient):
     """Task wrapper for the Price Scraper."""
+    logger.info("[PRICE_PIPELINE] Starting product scrape from {}", url)
     records: list[ProductPriceRecord] = []
     async for record in scraper.stream_prices(url):
         await broker.send_price_data(record)
         records.append(record)
+        count = len(records)
+        if count <= 5 or count % 100 == 0:
+            logger.info(
+                "[PRICE_PIPELINE] Scraped and published product #{}: "
+                "id={} name={!r} price={} {}",
+                count,
+                record.product_id,
+                record.product_name,
+                record.price,
+                record.currency,
+            )
+    logger.info(
+        "[PRICE_PIPELINE] Finished product scrape. Published {} product events.",
+        len(records),
+    )
     return records
 
 
@@ -32,10 +48,24 @@ async def run_currency_task(
     broker: MessageBrokerClient,
 ):
     """Fetch and publish one currency-rate snapshot."""
+    logger.info("[FX_PIPELINE] Fetching currency-rate snapshot. Base={}", base)
     records: list[CurrencyRateRecord] = []
     for record in await fetcher.fetch_rates(base):
         await broker.send_currency_data(record)
         records.append(record)
+        count = len(records)
+        if count <= 5 or count % 25 == 0:
+            logger.info(
+                "[FX_PIPELINE] Scraped and published FX rate #{}: {}/{} = {}",
+                count,
+                record.base_currency,
+                record.target_currency,
+                record.rate,
+            )
+    logger.info(
+        "[FX_PIPELINE] Finished FX snapshot. Published {} currency events.",
+        len(records),
+    )
     return records
 
 

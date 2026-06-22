@@ -6,6 +6,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, status
+from loguru import logger
 from pydantic import AnyHttpUrl, BaseModel, Field
 
 from sitemap_exchange_rate_processors.broker import (
@@ -20,6 +21,7 @@ from sitemap_exchange_rate_processors.scrapers.compare_sitemap_exchange_rates im
     run_currency_task,
     run_price_task,
 )
+from sitemap_exchange_rate_processors.storage import DatabaseSettings, PostgresStorage
 
 
 DEFAULT_CURRENCY_URL = os.getenv("CURRENCY_URL", ENGINE_DEFAULT_CURRENCY_URL)
@@ -83,6 +85,8 @@ class PipelineRunResponse(BaseModel):
     rate_topic: str
     product_records_published: int
     currency_records_published: int
+    sample_products: list[dict[str, Any]]
+    sample_rates: list[dict[str, Any]]
 
 
 class HealthResponse(BaseModel):
@@ -90,6 +94,14 @@ class HealthResponse(BaseModel):
 
     status: str
     service: str
+
+
+class ReadinessResponse(BaseModel):
+    """Dependency readiness response."""
+
+    status: str
+    postgres: str
+    database_url_configured: bool
 
 
 @app.get("/", response_model=dict[str, str])
@@ -109,6 +121,32 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         service="delta-nexus-scraper-kafka-api",
+    )
+
+
+@app.get("/ready", response_model=ReadinessResponse)
+async def ready() -> ReadinessResponse:
+    """Confirm that FastAPI can reach PostgreSQL."""
+    settings = DatabaseSettings.from_env()
+    storage = PostgresStorage(settings)
+    try:
+        await storage.connect()
+        await storage.health_check()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": "PostgreSQL is not reachable.",
+                "error": str(exc),
+            },
+        ) from exc
+    finally:
+        await storage.disconnect()
+
+    return ReadinessResponse(
+        status="ready",
+        postgres="ok",
+        database_url_configured=bool(settings.database_url),
     )
 
 
@@ -132,7 +170,19 @@ async def run_pipeline(request: PipelineRunRequest) -> PipelineRunResponse:
     )
 
     try:
+        logger.info(
+            "[API] Received pipeline run request: price_url={} currency_url={} "
+            "base_currency={} price_topic={} rate_topic={} kafka={}",
+            request.price_url,
+            request.currency_url,
+            request.base_currency.upper(),
+            request.price_topic,
+            request.rate_topic,
+            request.kafka_servers,
+        )
+        logger.info("[API] Connecting Kafka producer")
         await producer.connect()
+        logger.info("[API] Starting product and FX scraping tasks")
         price_records, rate_records = await asyncio.gather(
             run_price_task(AsyncPriceScraper(), str(request.price_url), producer),
             run_currency_task(
@@ -141,7 +191,13 @@ async def run_pipeline(request: PipelineRunRequest) -> PipelineRunResponse:
                 producer,
             ),
         )
+        logger.info(
+            "[API] Pipeline run complete: published {} product events and {} FX events",
+            len(price_records),
+            len(rate_records),
+        )
     except Exception as exc:
+        logger.exception("[API] Pipeline run failed")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
@@ -162,6 +218,12 @@ async def run_pipeline(request: PipelineRunRequest) -> PipelineRunResponse:
         rate_topic=request.rate_topic,
         product_records_published=len(price_records),
         currency_records_published=len(rate_records),
+        sample_products=[
+            record.model_dump(mode="json") for record in price_records[:5]
+        ],
+        sample_rates=[
+            record.model_dump(mode="json") for record in rate_records[:5]
+        ],
     )
 
 
@@ -174,6 +236,7 @@ async def config() -> dict[str, Any]:
         "default_price_topic": PRICE_TOPIC,
         "default_rate_topic": FX_TOPIC,
         "default_base_currency": DEFAULT_BASE_CURRENCY,
+        "database_url_configured": bool(DatabaseSettings.from_env().database_url),
         "pipeline_endpoint": "/pipeline/run",
     }
 

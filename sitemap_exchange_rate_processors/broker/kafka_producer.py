@@ -1,5 +1,6 @@
 import json
 from contextlib import suppress
+from datetime import datetime, timezone
 
 from aiokafka import AIOKafkaProducer
 from loguru import logger
@@ -63,7 +64,7 @@ class KafkaProducerClient(MessageBrokerClient):
         event = {
             "schema_version": SCHEMA_VERSION,
             "event_type": "product_price",
-            "emitted_at": record.timestamp,
+            "emitted_at": datetime.now(timezone.utc),
             **record.model_dump(mode="json"),
         }
         try:
@@ -90,7 +91,7 @@ class KafkaProducerClient(MessageBrokerClient):
         event = {
             "schema_version": SCHEMA_VERSION,
             "event_type": "currency_rate",
-            "emitted_at": record.timestamp,
+            "emitted_at": datetime.now(timezone.utc),
             **record.model_dump(mode="json"),
         }
         try:
