@@ -1,6 +1,12 @@
+networks:
+  delta-nexus:
+    driver: bridge
+
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
+    networks:
+      - delta-nexus
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -10,10 +16,13 @@ services:
       test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep Mode"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 20s
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
+    networks:
+      - delta-nexus
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -28,17 +37,21 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
-  # Optional: Kafka UI for visualizing topics and messages
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
+    networks:
+      - delta-nexus
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
@@ -48,6 +61,8 @@ services:
 
   api:
     build: .
+    networks:
+      - delta-nexus
     depends_on:
       kafka:
         condition: service_healthy
@@ -56,15 +71,18 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       OUTPUT_DIR: /app/outputs
-      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgresql://postgres:saimpersonal@host.docker.internal:5432/delta_nexus_test}
+      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgresql://postgres@/delta_nexus_test?host=/var/run/postgresql}
     volumes:
       - ./outputs:/app/outputs
+      - /var/run/postgresql:/var/run/postgresql
 
   frontend:
     build:
       context: ./sitemap_exchange_rate_processors/frontend
       args:
         VITE_API_BASE_URL: http://localhost:8000
+    networks:
+      - delta-nexus
     depends_on:
       - api
     ports:

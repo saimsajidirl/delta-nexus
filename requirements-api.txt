@@ -9,3 +9,4 @@ selectolax==0.3.27
 uvicorn==0.34.0
 botasaurus
 pandas
+matplotlib
