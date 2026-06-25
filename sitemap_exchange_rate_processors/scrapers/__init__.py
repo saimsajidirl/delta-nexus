@@ -1,11 +1,11 @@
 """Canonical scraper APIs for Delta Nexus."""
 
-from .compare_sitemap_exchange_rates import run_delta_nexus_engine
+from .ali_express_scraper import run_aliexpress_scraper
+from .compare_products_exchange_rates import run_delta_nexus_engine
 from .scrape_exchange_rates import AsyncCurrencyFetcher
-from .scrape_sitemaps import AsyncPriceScraper
 
 __all__ = [
-    "AsyncPriceScraper",
+    "run_aliexpress_scraper",
     "AsyncCurrencyFetcher",
     "run_delta_nexus_engine",
 ]

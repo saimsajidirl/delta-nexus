@@ -18,8 +18,9 @@ from sitemap_exchange_rate_processors.broker import (
     PRICE_TOPIC,
     KafkaProducerClient,
 )
-from sitemap_exchange_rate_processors.scrapers import AsyncCurrencyFetcher, AsyncPriceScraper
-from sitemap_exchange_rate_processors.scrapers.compare_sitemap_exchange_rates import (
+from sitemap_exchange_rate_processors.scrapers import AsyncCurrencyFetcher, run_aliexpress_scraper
+from sitemap_exchange_rate_processors.scrapers.ali_express_scraper import ALIEXPRESS_URL
+from sitemap_exchange_rate_processors.scrapers.compare_products_exchange_rates import (
     DEFAULT_BASE_CURRENCY,
     DEFAULT_CURRENCY_URL as ENGINE_DEFAULT_CURRENCY_URL,
     run_currency_task,
@@ -61,9 +62,9 @@ app.add_middleware(
 class PipelineRunRequest(BaseModel):
     """Request body for one scraper-to-Kafka pipeline run."""
 
-    price_url: AnyHttpUrl = Field(
-        ...,
-        description="XML product feed or sitemap URL to scrape.",
+    aliexpress_url: AnyHttpUrl = Field(
+        default=ALIEXPRESS_URL,
+        description="AliExpress page URL to scrape for product listings.",
     )
     currency_url: AnyHttpUrl = Field(
         default=DEFAULT_CURRENCY_URL,
@@ -98,7 +99,7 @@ class PipelineRunResponse(BaseModel):
     status: str
     message: str
     session_id: str | None = None
-    price_url: str
+    aliexpress_url: str
     currency_url: str
     kafka_servers: str
     price_topic: str
@@ -112,9 +113,9 @@ class PipelineRunResponse(BaseModel):
 class SessionPipelineRunRequest(BaseModel):
     """Request body for one session-scoped pipeline run."""
 
-    price_url: AnyHttpUrl = Field(
-        ...,
-        description="XML product feed or sitemap URL to scrape.",
+    aliexpress_url: AnyHttpUrl = Field(
+        default=ALIEXPRESS_URL,
+        description="AliExpress page URL to scrape for product listings.",
     )
     currency_url: AnyHttpUrl = Field(
         default=DEFAULT_CURRENCY_URL,
@@ -271,9 +272,9 @@ async def run_pipeline(request: PipelineRunRequest) -> PipelineRunResponse:
 
     try:
         logger.info(
-            "[API] Received pipeline run request: price_url={} currency_url={} "
+            "[API] Received pipeline run request: aliexpress_url={} currency_url={} "
             "base_currency={} price_topic={} rate_topic={} kafka={}",
-            request.price_url,
+            request.aliexpress_url,
             request.currency_url,
             request.base_currency.upper(),
             request.price_topic,
@@ -282,9 +283,9 @@ async def run_pipeline(request: PipelineRunRequest) -> PipelineRunResponse:
         )
         logger.info("[API] Connecting Kafka producer")
         await producer.connect()
-        logger.info("[API] Starting product and FX scraping tasks")
+        logger.info("[API] Starting AliExpress product scrape and FX tasks")
         price_records, rate_records = await asyncio.gather(
-            run_price_task(AsyncPriceScraper(), str(request.price_url), producer),
+            run_price_task(producer, str(request.aliexpress_url)),
             run_currency_task(
                 AsyncCurrencyFetcher(str(request.currency_url)),
                 request.base_currency.upper(),
@@ -310,8 +311,8 @@ async def run_pipeline(request: PipelineRunRequest) -> PipelineRunResponse:
 
     return PipelineRunResponse(
         status="completed",
-        message="Scraped product and currency data, then published events to Kafka.",
-        price_url=str(request.price_url),
+        message="Scraped AliExpress products and currency data, then published events to Kafka.",
+        aliexpress_url=str(request.aliexpress_url),
         currency_url=str(request.currency_url),
         kafka_servers=request.kafka_servers,
         price_topic=request.price_topic,
@@ -379,9 +380,9 @@ async def run_session_pipeline(
         )
         add_session_log(session_id, "info", "Connecting Kafka producer")
         await producer.connect()
-        add_session_log(session_id, "info", "Scraping product feed and FX rates")
+        add_session_log(session_id, "info", "Scraping AliExpress products and FX rates")
         price_records, rate_records = await asyncio.gather(
-            run_price_task(AsyncPriceScraper(), str(request.price_url), producer),
+            run_price_task(producer, str(request.aliexpress_url)),
             run_currency_task(
                 AsyncCurrencyFetcher(str(request.currency_url)),
                 request.base_currency.upper(),
@@ -442,9 +443,9 @@ async def run_session_pipeline(
 
     return PipelineRunResponse(
         status="completed",
-        message="Session data was scraped, published to Kafka, and persisted to PostgreSQL.",
+        message="Session AliExpress data was scraped, published to Kafka, and persisted to PostgreSQL.",
         session_id=session_id,
-        price_url=str(request.price_url),
+        aliexpress_url=str(request.aliexpress_url),
         currency_url=str(request.currency_url),
         kafka_servers=request.kafka_servers,
         price_topic=price_topic,

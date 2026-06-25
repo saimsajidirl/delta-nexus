@@ -17,3 +17,5 @@ dist/
 .vscode/
 outputs/
 * .ipynb 
+saim_Env/**
+saim_Env/

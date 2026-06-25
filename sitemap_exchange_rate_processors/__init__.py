@@ -15,13 +15,13 @@ from .broker import (
     SCHEMA_VERSION,
 )
 from .scrapers import (
-    AsyncPriceScraper,
+    run_aliexpress_scraper,
     AsyncCurrencyFetcher,
     run_delta_nexus_engine,
 )
 
 __all__ = [
-    "AsyncPriceScraper",
+    "run_aliexpress_scraper",
     "AsyncCurrencyFetcher",
     "MessageBrokerClient",
     "EventEnvelope",
